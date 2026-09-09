@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crypto_quant"]
+
+[project]
+name = "crypto-quant-terminal"
+version = "0.1.0"
+description = "Production-grade crypto quantitative research & trading system"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Crypto Quant Terminal" }]
+
+dependencies = [
+    # Core
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+
+    # Data & Analysis
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+
+    # Database
+    "sqlalchemy>=2.0.0",
+
+    # Exchange
+    "python-binance>=1.0.19",
+    "ccxt>=4.0.0",
+
+    # Technical Indicators (TA-Lib alternative)
+    # "pandas-ta>=0.3.14b",  # Skipped for now, will implement custom indicators
+
+    # ML
+    "scikit-learn>=1.3.0",
+    "xgboost>=2.0.0",
+
+    # Visualization
+    "matplotlib>=3.7.0",
+    "plotly>=5.14.0",
+
+    # Terminal UI
+    "rich>=13.0.0",
+    "typer>=0.9.0",
+
+    # Testing
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+
+    # Utilities
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    "tenacity>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+crypto-quant = "crypto_quant.cli.main:app"
+cq = "crypto_quant.cli.main:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
