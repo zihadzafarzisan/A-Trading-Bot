@@ -24,10 +24,26 @@ def generate_strategy_id(name: str, version: int = 1) -> str:
     return f"STRAT-{hash_suffix.upper()}"
 
 
+_TID_LAST_MS = 0
+_TID_COUNTER = 0
+
+
 def generate_trade_id() -> str:
-    """Generate unique trade ID."""
+    """Generate a unique trade ID.
+
+    Uses millisecond time plus a per-millisecond monotonic counter so rapid,
+    same-millisecond calls (e.g. a fast paper-trading replay closing many
+    trades in one tick) still get distinct ids — a plain timestamp hash
+    collides when trades are closed faster than the clock advances.
+    """
+    global _TID_LAST_MS, _TID_COUNTER
     timestamp = int(time.time() * 1000)
-    hash_suffix = hashlib.md5(str(timestamp).encode()).hexdigest()[:8]
+    if timestamp == _TID_LAST_MS:
+        _TID_COUNTER += 1
+    else:
+        _TID_LAST_MS = timestamp
+        _TID_COUNTER = 0
+    hash_suffix = hashlib.md5(f"{timestamp}:{_TID_COUNTER}".encode()).hexdigest()[:8]
     return f"TRADE-{hash_suffix.upper()}"
 
 

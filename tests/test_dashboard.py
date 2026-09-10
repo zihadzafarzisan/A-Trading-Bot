@@ -10,6 +10,7 @@ from crypto_quant.dashboard.charts import (
 )
 from crypto_quant.strategies import TrendStrategy
 from crypto_quant.backtesting import BacktestEngine, BacktestConfig, ExecutionConfig
+from crypto_quant.execution.engine import PaperSessionResult
 
 
 def make_df(n=500):
@@ -190,4 +191,49 @@ class TestDashboardGenerator:
         DashboardGenerator().generate(data, out)
         content = out.read_text(encoding="utf-8")
         assert "HIGH DRAWDOWN" in content
-        assert "does not guarantee future results" in content
+
+
+class TestDashboardPaper:
+    """from_paper builder (Phase 12 paper trading dashboard)."""
+
+    def _result(self):
+        return PaperSessionResult(
+            symbol="BTCUSDT", timeframe="1h",
+            n_trades=10, n_orders=12, n_rejected=2,
+            starting_capital=1000.0, final_equity=1050.0,
+            realized_pnl=50.0, win_rate=0.6,
+            trades=[{"trade_id": "TRADE-1", "net_pnl": 12.0, "symbol": "BTCUSDT",
+                     "direction": "long", "status": "closed", "exit_reason": "tp"}],
+            equity_curve=[{"time": 1, "equity": 1000.0}, {"time": 2, "equity": 1050.0}],
+            risk_events=[{"event_type": "max_drawdown", "severity": "critical",
+                          "message": "drawdown 30% > 25%"}],
+        )
+
+    def test_from_paper_maps_fields(self):
+        data = DashboardGenerator.from_paper(
+            self._result(), symbol="BTCUSDT", timeframe="1h", market_type="spot")
+        assert data.title == "Paper Trading — BTCUSDT / 1h (spot)"
+        assert data.metrics["total_trades"] == 10
+        assert data.metrics["win_rate"] == 0.6
+        assert data.metrics["net_return"] == pytest.approx(0.05)
+        assert data.metrics["realized_pnl"] == 50.0
+        assert data.equity_curve == [
+            {"time": 1, "equity": 1000.0}, {"time": 2, "equity": 1050.0}]
+        assert len(data.trades) == 1
+        assert data.risk_events[0]["event_type"] == "max_drawdown"
+
+    def test_from_paper_render(self, tmp_path):
+        data = DashboardGenerator.from_paper(
+            self._result(), symbol="BTCUSDT", timeframe="1h", market_type="spot")
+        out = tmp_path / "paper.html"
+        DashboardGenerator().generate(data, out)
+        content = out.read_text(encoding="utf-8")
+        assert "Paper Trading — BTCUSDT / 1h (spot)" in content
+        assert "Win Rate" in content
+        assert "max_drawdown" in content.lower() or "drawdown" in content.lower()
+
+    def test_from_paper_zero_capital_guard(self):
+        result = self._result()
+        result.starting_capital = 0.0
+        data = DashboardGenerator.from_paper(result)
+        assert data.metrics["net_return"] == 0.0

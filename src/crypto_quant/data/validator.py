@@ -192,9 +192,10 @@ class DataValidator:
         # NaN in OHLCV
         nan_mask = df[["open", "high", "low", "close", "volume"]].isna()
         if nan_mask.any().any():
+            n_nans = int(nan_mask.values.sum())
             report.issues.append(
                 ValidationIssue(None, "nan_values", "warning",
-                                f"NaN values present in {int(nan_mask.sum().sum())} cell(s)")
+                                f"NaN values present in {n_nans} cell(s)")
             )
 
         # Zero/negative volume

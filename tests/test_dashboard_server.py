@@ -454,6 +454,50 @@ class TestDashboardServer:
             mock_server.assert_called_once()
             mock_instance.start.assert_called_once()
 
+    def _request_root(self, handler):
+        """Spin up a server with the given handler and GET /, returning (status, body)."""
+        import http.server
+        import threading
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_root_serves_fallback_html_when_no_index(self, tmp_path):
+        """GET / returns 200 serving an existing report when index.html is absent."""
+        from crypto_quant.dashboard.server import DashboardServer
+        # Put only report.html in the directory (no index.html) — mimics `serve dashboard`
+        report = tmp_path / "report.html"
+        report.write_text("<html><body>EXP-FALLBACK-CONTENT</body></html>", encoding="utf-8")
+
+        server = DashboardServer(directory=tmp_path, open_browser=False)
+        handler = server._create_handler()
+        status, body = self._request_root(handler)
+        assert status == 200
+        assert "EXP-FALLBACK-CONTENT" in body
+
+    def test_root_prefers_index_html_when_present(self, tmp_path):
+        """GET / serves index.html over report.html when both exist."""
+        from crypto_quant.dashboard.server import DashboardServer
+        (tmp_path / "index.html").write_text("<html><body>INDEX</body></html>", encoding="utf-8")
+        (tmp_path / "report.html").write_text("<html><body>REPORT</body></html>", encoding="utf-8")
+
+        server = DashboardServer(directory=tmp_path, open_browser=False)
+        handler = server._create_handler()
+        status, body = self._request_root(handler)
+        assert status == 200
+        assert "INDEX" in body
+        assert "REPORT" not in body
+
 
 class TestDashboardIntegration:
     """Integration tests for the dashboard pipeline."""

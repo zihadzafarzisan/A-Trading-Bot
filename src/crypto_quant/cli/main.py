@@ -32,6 +32,11 @@ from ..validation import WalkForwardValidator, MonteCarloSimulator
 from ..features.engine import FeatureEngine
 from ..ml import MLPipeline, TradePredictor, ModelTrainer
 from ..dashboard import DashboardData, DashboardGenerator, serve_dashboard
+from ..execution.paper import PaperBroker
+from ..execution.engine import PaperTradingEngine, PaperTradingConfig, DataframePriceSource
+from ..risk.manager import RiskManager
+from ..risk.limits import RiskLimits
+from ..db.models import ExecutionTrade
 from ..utils.constants import DEFAULT_SYMBOLS, HISTORICAL_UNIVERSE
 
 # Create Typer app
@@ -151,7 +156,7 @@ def handle_menu_choice(choice: str, config: AppConfig):
     elif choice == "10":
         console.print("[bold cyan]Portfolio Research - Coming in Phase 10[/bold cyan]")
     elif choice == "11":
-        console.print("[bold cyan]Paper Trading - Coming in Phase 12[/bold cyan]")
+        _paper_menu(config)
     elif choice == "12":
         console.print("[bold cyan]Live Trading - Coming in Phase 13[/bold cyan]")
     elif choice == "13":
@@ -855,15 +860,399 @@ def serve(
 
 @app.command()
 def paper(
-    action: str = typer.Argument(..., help="Action: start, stop, status"),
-    strategy: Optional[str] = typer.Option(None, "--strategy", "-s", help="Strategy ID"),
+    action: str = typer.Argument(..., help="Action: start, stop, status, report"),
+    strategy: Optional[str] = typer.Option(None, "--strategy", "-s", help="Strategy type: trend, momentum, mean_reversion, breakout"),
+    symbol: str = typer.Option("BTCUSDT", "--symbol", help="Symbol (e.g., BTCUSDT)"),
+    timeframe: str = typer.Option("1h", "--timeframe", "-t", help="Timeframe"),
+    market: str = typer.Option("spot", "--market", "-m", help="spot or futures"),
+    start: Optional[str] = typer.Option(None, "--start", help="Start date (YYYY-MM-DD)"),
+    end: Optional[str] = typer.Option(None, "--end", help="End date (YYYY-MM-DD)"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="HTML report path (report action)"),
+    live: bool = typer.Option(False, "--live", help="Run a live polling loop instead of replay"),
+    poll: Optional[float] = typer.Option(None, "--poll", help="Poll interval in seconds (live)"),
+    window: int = typer.Option(300, "--window", help="Warmup bars held for live signal generation"),
 ):
-    """Paper trading commands."""
-    console.print("[bold cyan]Paper Trading[/bold cyan]")
-    console.print(f"Action: {action}")
-    if strategy:
-        console.print(f"Strategy: {strategy}")
-    console.print("[yellow]Coming in Phase 12[/yellow]")
+    """Paper trading commands (simulated execution, never a real order)."""
+    console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
+    console.print("[bold cyan]                  PAPER TRADING[/bold cyan]")
+    console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
+
+    config = get_config()
+
+    if action == "start":
+        paper_start(
+            strategy=strategy, symbol=symbol, timeframe=timeframe, market=market,
+            start=start, end=end, config=config, live=live, poll=poll, window=window,
+        )
+    elif action == "status":
+        paper_status(config)
+    elif action == "stop":
+        paper_stop()
+    elif action == "report":
+        paper_report(strategy=strategy, symbol=symbol, timeframe=timeframe,
+                     market=market, start=start, end=end, output=output, config=config)
+    else:
+        console.print("[bold red]Unknown action:[/bold red] start, stop, status, report")
+
+
+# ---------------------------------------------------------------------------
+# Paper Trading helpers
+# ---------------------------------------------------------------------------
+SESSION_FILE = "data/paper_session.json"
+_LIVE_WAIT_S = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+
+
+def _paper_session_path() -> Path:
+    return Path(SESSION_FILE)
+
+
+def _fee_rate_for(config, market: str) -> float:
+    if market == "futures":
+        return config.fees.futures_taker
+    return config.fees.spot_taker
+
+
+def _run_one_session(strategy, symbol, timeframe, market, start, end, config,
+                     persist: bool = True):
+    """Load stored data and run a deterministic replay paper session.
+
+    Args:
+        persist: When True, write the session's trades to the database (used by
+            ``paper start``). ``paper report`` passes False so rendering a report
+            does not accumulate duplicate session rows.
+    """
+    db = get_db_manager()
+    db.create_tables()
+    repo = MarketDataRepository(db)
+
+    strat_types = [s.strip() for s in (strategy or "trend").split(",")]
+    if len(strat_types) != 1:
+        console.print("[bold red]Paper trading uses exactly one strategy type.[/bold red]")
+        raise typer.Abort()
+    strat_obj = create_strategy(strat_types[0])
+
+    start_ms = _parse_date_ms(start) or _parse_date_ms(config.data.start_date)
+    end_ms = _parse_date_ms(end) or _parse_date_ms(config.data.end_date)
+    df = repo.load(symbol, timeframe, start_ms, end_ms, market_type=market)
+    if df is None or len(df) < 60:
+        console.print(f"[bold red]Not enough data for {symbol} {timeframe}. Run `data download` first.[/bold red]")
+        raise typer.Abort()
+
+    fee_rate = _fee_rate_for(config, market)
+    broker = PaperBroker(
+        price_source=DataframePriceSource(df),
+        starting_capital=config.risk.starting_capital,
+        fee_rate=fee_rate,
+        slippage=config.fees.slippage,
+        market_type=market,
+    )
+    risk = RiskManager(RiskLimits.from_config(config.risk))
+    cfg = PaperTradingConfig(
+        symbol=symbol, market_type=market, timeframe=timeframe,
+        starting_capital=config.risk.starting_capital,
+        fee_rate=fee_rate, slippage=config.fees.slippage,
+    )
+    engine = PaperTradingEngine(strategy=strat_obj, broker=broker,
+                                risk_manager=risk, config=cfg,
+                                db=db if persist else None)
+    console.print(f"[bold]Symbol:[/bold] {symbol} | [bold]TF:[/bold] {timeframe} | "
+                  f"[bold]Market:[/bold] {market} | [bold]Strategy:[/bold] {strat_obj.strategy_type}")
+    result = engine.run_bars(df)
+    return result, strat_obj, broker, risk
+
+
+def paper_start(strategy, symbol, timeframe, market, start, end, config,
+                live: bool = False, poll: Optional[float] = None, window: int = 300):
+    """Start a paper trading session: deterministic replay, or a live loop with --live."""
+    db = get_db_manager()
+    db.create_tables()
+
+    if live:
+        _run_live_paper(strategy=strategy, symbol=symbol, timeframe=timeframe,
+                        market=market, config=config, db=db, poll=poll, window=window)
+        return
+
+    result, strat_obj, broker, risk = _run_one_session(
+        strategy, symbol, timeframe, market, start, end, config)
+    _print_paper_result(result, strat_obj.strategy_type)
+
+
+def _print_paper_result(result, strat_type: str) -> None:
+    from datetime import datetime as _dt, timezone as _tz
+    starting = float(result.starting_capital or 0.0)
+    net_return = (result.final_equity - starting) / starting if starting else 0.0
+    table = Table(title="Paper Trading Session Summary", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right", style="green")
+    table.add_row("Strategy", strat_type)
+    table.add_row("Starting Capital", f"${starting:,.2f}")
+    table.add_row("Final Equity", f"${result.final_equity:,.2f}")
+    table.add_row("Realized PnL", f"${result.realized_pnl:,.2f}")
+    table.add_row("Net Return", f"{net_return:+.2%}")
+    table.add_row("Trades", str(result.n_trades))
+    table.add_row("Orders", str(result.n_orders))
+    table.add_row("Rejected", str(result.n_rejected))
+    table.add_row("Win Rate", f"{result.win_rate:.1%}")
+    console.print(table)
+    for ev in (result.risk_events or [])[:10]:
+        console.print(f"  [yellow]{ev.get('severity', 'risk')} • {ev.get('event_type', '')}:[/yellow] {ev.get('message', '')}")
+    console.print(f"\n[green]✓[/green] Session persisted (execution_mode=paper). Run `paper status` to review.")
+
+
+def paper_status(config) -> None:
+    """Show a live session (if any) plus recent persisted paper trades."""
+    from datetime import datetime as _dt, timezone as _tz
+    db = get_db_manager()
+    db.create_tables()
+
+    session_path = _paper_session_path()
+    if session_path.exists():
+        try:
+            import json
+            state = json.loads(session_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+        if state.get("phase") == "running":
+            console.print("[bold cyan]Active live paper session:[/bold cyan]")
+            for k in ("run_id", "symbol", "timeframe", "market_type", "strategy", "started_at", "last_seen"):
+                if state.get(k):
+                    console.print(f"  [cyan]{k}:[/cyan] {state[k]}")
+            console.print(f"  [cyan]equity:[/cyan] {state.get('equity')}  [cyan]n_trades:[/cyan] {state.get('n_trades')}")
+
+    s = db.get_session()
+    try:
+        rows = (s.query(ExecutionTrade)
+                .filter(ExecutionTrade.execution_mode == "paper")
+                .order_by(ExecutionTrade.created_at.desc())
+                .limit(500).all())
+    finally:
+        s.close()
+
+    if not rows:
+        console.print("[yellow]No paper trades yet. Run: python -m crypto_quant paper start[/yellow]")
+        return
+
+    pnls = [r.net_pnl or 0.0 for r in rows]
+    realized = sum(pnls)
+    wins = sum(1 for p in pnls if p > 0)
+    capital = float(config.risk.starting_capital)
+
+    summary = Table(title="Paper Account Summary", show_header=True)
+    summary.add_column("Metric", style="cyan")
+    summary.add_column("Value", justify="right", style="green")
+    summary.add_row("Starting Capital", f"${capital:,.2f}")
+    summary.add_row("Realized PnL (paper)", f"${realized:,.2f}")
+    summary.add_row("Est. Paper Equity", f"${capital + realized:,.2f}")
+    summary.add_row("Closed Trades", str(len(rows)))
+    summary.add_row("Win Rate", f"{(wins / len(rows)):.1%}" if rows else "n/a")
+    console.print(summary)
+
+    table = Table(title="Recent Paper Trades", show_header=True)
+    table.add_column("ID", style="cyan")
+    table.add_column("Symbol", style="magenta")
+    table.add_column("Side", style="white")
+    table.add_column("Entry", justify="right")
+    table.add_column("Exit", justify="right")
+    table.add_column("Qty", justify="right")
+    table.add_column("Net PnL", justify="right")
+    table.add_column("Reason", style="yellow")
+    table.add_column("Exit Time")
+    for r in rows[:20]:
+        color = "green" if (r.net_pnl or 0) >= 0 else "red"
+        reason = r.exit_reason or "-"
+        symbol = r.symbol
+        side = r.direction
+        table.add_row(
+            r.id, symbol, side,
+            f"{r.entry_price:.4f}", f"{r.exit_price:.4f}" if r.exit_price else "-",
+            f"{r.quantity:.4f}", f"[{color}]{r.net_pnl:.4f}[/{color}]",
+            reason,
+            _dt.fromtimestamp((r.exit_time or 0) / 1000, tz=_tz.utc).strftime("%Y-%m-%d %H:%M") if r.exit_time else "-",
+        )
+    console.print(table)
+
+
+def paper_stop() -> None:
+    """Request a stop for a live session; replay sessions close automatically."""
+    session_path = _paper_session_path()
+    if session_path.exists():
+        try:
+            import json
+            state = json.loads(session_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+        if state.get("phase") == "running" and not state.get("stopped"):
+            state["stop_requested"] = True
+            session_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            console.print("[yellow]Stop requested. The live session will shut down on its next tick and persist.[/yellow]")
+            return
+    console.print("[yellow]No active live paper session to stop. Replay sessions close & persist automatically.[/yellow]")
+
+
+def paper_report(strategy, symbol, timeframe, market, start, end, output, config) -> None:
+    """Generate a dashboard report for a paper session (manual, offline replay)."""
+    out = Path(output) if output else Path("dashboard") / "paper_report.html"
+    result, strat_obj, broker, risk = _run_one_session(
+        strategy, symbol, timeframe, market, start, end, config, persist=False)
+    data = DashboardGenerator.from_paper(
+        result, symbol=symbol, timeframe=timeframe, market_type=market)
+    path = DashboardGenerator().generate(data, out)
+    console.print(f"[green]✓[/green] Paper report written to {path}")
+
+
+def _run_live_paper(strategy, symbol, timeframe, market, config, db,
+                    poll: Optional[float] = None, window: int = 300) -> None:
+    """Live paper loop: poll completed bars, risk-gate signals, paper-execute.
+
+    Runs until the session state file has stop_requested=true (set by `paper stop`
+    from another process) or KeyboardInterrupt.
+    """
+    import json
+    import time
+    from datetime import datetime, timezone
+
+    strat_types = [s.strip() for s in (strategy or "trend").split(",")]
+    if len(strat_types) != 1:
+        console.print("[bold red]Paper trading uses exactly one strategy type.[/bold red]")
+        raise typer.Abort()
+    strat_obj = create_strategy(strat_types[0])
+    fee_rate = _fee_rate_for(config, market)
+
+    adapter = BinanceAdapter(market_type=market)
+    interval = poll or _LIVE_WAIT_S.get(timeframe, 60)
+    run_id = f"PAPER-{int(time.time() * 1000)}"
+    session_path = _paper_session_path()
+
+    def _write_state(**updates):
+        state = {
+            "run_id": run_id, "symbol": symbol, "timeframe": timeframe,
+            "market_type": market, "strategy": strat_obj.strategy_type,
+            "started_at": started_at, "last_seen": datetime.now(timezone.utc).isoformat(),
+            "phase": "running", "stop_requested": False, "stopped": False,
+            "equity": None, "n_trades": 0,
+        }
+        state.update(updates)
+        session_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def _stop_requested() -> bool:
+        try:
+            return bool(json.loads(session_path.read_text(encoding="utf-8")).get("stop_requested"))
+        except Exception:
+            return False
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+
+    broker = PaperBroker(
+        price_source=DataframePriceSource(_empty_frame()),
+        starting_capital=config.risk.starting_capital,
+        fee_rate=fee_rate, slippage=config.fees.slippage, market_type=market,
+    )
+    risk = RiskManager(RiskLimits.from_config(config.risk))
+    cfg = PaperTradingConfig(
+        symbol=symbol, market_type=market, timeframe=timeframe,
+        starting_capital=config.risk.starting_capital,
+        fee_rate=fee_rate, slippage=config.fees.slippage,
+    )
+    engine = PaperTradingEngine(strategy=strat_obj, broker=broker,
+                                risk_manager=risk, config=cfg, db=db)
+    _write_state()
+
+    console.print(f"[bold cyan]Live paper session started ({run_id})[/bold cyan]")
+    console.print(f"[bold]Symbol:[/bold] {symbol} | [bold]TF:[/bold] {timeframe} | "
+                  f"[bold]Market:[/bold] {market} | [bold]Poll:[/bold] {interval}s")
+    console.print("[dim]Run `paper stop` from another shell to stop gracefully. Ctrl+C also stops.[/dim]")
+
+    try:
+        df = adapter.get_ohlcv_as_dataframe(symbol, timeframe, limit=window)
+        if df is None or df.empty:
+            console.print("[bold red]No live data returned. Check network / symbol availability.[/bold red]")
+            return
+        df = df.reset_index(drop=True)
+        broker.price_source = DataframePriceSource(df)
+        broker.price_source.set_index(len(df) - 1)
+        last_ts = int(df["timestamp"].iloc[-1])
+
+        while True:
+            time.sleep(interval)
+            try:
+                ndf = adapter.get_ohlcv_as_dataframe(symbol, timeframe, limit=window)
+            except Exception as exc:
+                console.print(f"[yellow]fetch error: {exc}[/yellow]")
+                continue
+            if ndf is None or ndf.empty:
+                continue
+            ndf = ndf.reset_index(drop=True)
+            ts = int(ndf["timestamp"].iloc[-1])
+            if ts == last_ts:
+                continue
+            last_ts = ts
+
+            df = ndf
+            broker.price_source = DataframePriceSource(df)
+            broker.price_source.set_index(len(df) - 1)
+            prepared = strat_obj.setup(df)
+            signal = strat_obj.generate_signal(prepared, len(df) - 1)
+            bar = {
+                "open": float(df["open"].iloc[-1]),
+                "high": float(df["high"].iloc[-1]),
+                "low": float(df["low"].iloc[-1]),
+                "close": float(df["close"].iloc[-1]),
+                "timestamp": int(ts),
+            }
+            engine.set_live_signal(signal)
+            engine.on_bar(bar)
+            _write_state(equity=round(broker.equity, 2),
+                         n_trades=len(broker.closed_trades))
+            console.print(f"[dim][{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
+                          f"equity={broker.equity:.2f} closed={len(broker.closed_trades)}[/dim]")
+
+            if _stop_requested():
+                console.print("[yellow]Stop requested — closing positions and persisting.[/yellow]")
+                break
+
+        # Graceful close + persist
+        now_ms = int(time.time() * 1000)
+        broker.close_all(reason="live_stop")
+        broker.mark_positions(now_ms)
+        result = engine._result()
+        if engine.db:
+            engine._persist(result)
+        _write_state(phase="stopped", equity=round(broker.equity, 2),
+                     n_trades=len(broker.closed_trades), stopped=True)
+        console.print("[green]✓[/green] Live paper session stopped and persisted.")
+        _print_paper_result(result, strat_obj.strategy_type)
+    except KeyboardInterrupt:
+        now_ms = int(time.time() * 1000)
+        broker.close_all(reason="manual_stop")
+        broker.mark_positions(now_ms)
+        result = engine._result()
+        if engine.db:
+            engine._persist(result)
+        _write_state(phase="stopped", equity=round(broker.equity, 2),
+                     n_trades=len(broker.closed_trades), stopped=True)
+        console.print("\n[yellow]Interrupted — session stopped and persisted.[/yellow]")
+        _print_paper_result(result, strat_obj.strategy_type)
+    finally:
+        adapter.close()
+
+
+def _empty_frame():
+    import pandas as pd
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
+def _paper_menu(config) -> None:
+    """Interactive paper trading flow from the main menu (replay by default)."""
+    strategy = Prompt.ask("Strategy type", default="trend")
+    symbol = Prompt.ask("Symbol", default="BTCUSDT")
+    timeframe = Prompt.ask("Timeframe", default="1h")
+    market = Prompt.ask("Market", choices=["spot", "futures"], default="spot")
+    try:
+        paper_start(strategy=strategy, symbol=symbol, timeframe=timeframe,
+                    market=market, start=None, end=None, config=config)
+    except typer.Abort:
+        console.print("[yellow]Paper trading cancelled.[/yellow]")
 
 
 @app.command()

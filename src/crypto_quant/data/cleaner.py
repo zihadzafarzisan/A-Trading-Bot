@@ -137,7 +137,7 @@ class DataCleaner:
         if not outlier_idx.any():
             return df
 
-        report.n_outliers_replaced = int(outlier_idx.sum())
+        report.n_outliers_replaced = int(mask.fillna(False).sum())
         if self.replace_outliers:
             # Replace outlier candles' OHLC with the rolling median of close
             med = df["close"].rolling(5, min_periods=1).median()
