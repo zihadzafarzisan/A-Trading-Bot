@@ -41,8 +41,35 @@ class DatabaseManager:
         )
 
     def create_tables(self) -> None:
-        """Create all database tables."""
+        """Create all missing tables and migrate existing ones.
+
+        SQLite's ``create_all`` adds new tables but does NOT add new columns to
+        tables that already exist, so we run a lightweight ALTER pass for any
+        column that is in the model but missing from an existing table. This
+        upgrades a pre-existing project DB in place without a rebuild.
+        """
         Base.metadata.create_all(bind=self.engine)
+        self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        """Add any model columns missing from existing tables (idempotent)."""
+        from sqlalchemy import inspect, text
+        inspector = inspect(self.engine)
+        existing = {t: set(c["name"] for c in inspector.get_columns(t))
+                    for t in inspector.get_table_names()}
+        with self.engine.begin() as conn:
+            for table in Base.metadata.sorted_tables:
+                cols = existing.get(table.name)
+                if cols is None:
+                    continue
+                for col in table.columns:
+                    if col.name in cols:
+                        continue
+                    # Match SQLite type from the column definition.
+                    coltype = col.type.compile(dialect=self.engine.dialect)
+                    conn.execute(text(
+                        f"ALTER TABLE {table.name} ADD COLUMN {col.name} {coltype}"
+                    ))
 
     def drop_tables(self) -> None:
         """Drop all database tables (for testing)."""

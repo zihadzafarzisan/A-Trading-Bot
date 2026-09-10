@@ -199,6 +199,7 @@ class PaperBroker(Broker):
             "direction": pos["side"],
             "execution_mode": "paper",
             "market_type": self.market_type,
+            "timeframe": pos.get("timeframe"),
             "entry_price": pos["entry_price"],
             "exit_price": price,
             "quantity": qty,
@@ -209,6 +210,10 @@ class PaperBroker(Broker):
             "exit_time": None,  # set by the engine when it knows the bar time
             "status": "closed",
             "exit_reason": "paper_fill",
+            "leverage": pos.get("leverage", 1),
+            "funding": pos.get("funding", 0.0),
+            "stop_loss": pos.get("stop_loss"),
+            "take_profit": pos.get("take_profit"),
         })
 
     @staticmethod

@@ -7,7 +7,19 @@ from .broker import (
     PriceSource,
     AdapterPriceSource,
 )
+from .engine import (
+    PaperTradingEngine,
+    PaperTradingConfig,
+    PaperSessionResult,
+    DataframePriceSource,
+)
 from .paper import PaperBroker
+from .persistence import (
+    save_account_snapshot,
+    load_account_snapshot,
+    restore_broker_state,
+    persist_risk_events,
+)
 from .standalone_agent import (
     Alert,
     AlertLevel,
@@ -21,6 +33,7 @@ from .worker import (
     LiveTradingWorker,
     WorkerConfig,
     WorkerState,
+    WorkerLock,
     load_strategy_from_registry,
 )
 
@@ -32,6 +45,16 @@ __all__ = [
     "AdapterPriceSource",
     "Order",
     "PaperBroker",
+    # Engine
+    "PaperTradingEngine",
+    "PaperTradingConfig",
+    "PaperSessionResult",
+    "DataframePriceSource",
+    # Persistence
+    "save_account_snapshot",
+    "load_account_snapshot",
+    "restore_broker_state",
+    "persist_risk_events",
     # Monitoring
     "Alert",
     "AlertLevel",
@@ -44,5 +67,6 @@ __all__ = [
     "LiveTradingWorker",
     "WorkerConfig",
     "WorkerState",
+    "WorkerLock",
     "load_strategy_from_registry",
 ]

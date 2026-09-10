@@ -213,19 +213,30 @@ class MarketDataRepository:
 
         if incremental and stored_lo is not None and stored_hi is not None:
             # Case 1: Requested range is entirely WITHIN the stored range
-            # (stored_lo <= start_ms AND stored_hi + interval >= end_ms)
             if stored_lo <= start_ms and stored_hi + interval >= end_ms:
                 already_covered = True
 
-            # Case 2: Requested range starts AFTER the stored range
-            # (stored_hi < start_ms) - Non-contiguous, download from requested start
+            # Case 2: Requested range is entirely AFTER the stored range
             elif stored_hi < start_ms:
-                download_start = start_ms  # FIX: Don't bridge the gap
+                download_start = start_ms
 
-            # Case 3: Requested range overlaps with stored data
-            # (some overlap exists, extend from where stored data ends)
-            else:
+            # Case 3: Requested range is entirely BEFORE the stored range
+            elif end_ms <= stored_lo:
+                download_start = start_ms
+                download_end = end_ms
+
+            # Case 4: Overlaps on the right (fetch the missing right part)
+            elif stored_lo <= start_ms <= stored_hi + interval:
                 download_start = stored_hi + interval
+
+            # Case 5: Overlaps on the left (fetch the missing left part)
+            elif start_ms < stored_lo:
+                download_end = stored_lo
+                # and maybe fetch the missing right part too? We only support one continuous fetch window here,
+                # so we just fetch the whole requested range if it spans across the existing data.
+                download_start = start_ms
+                if end_ms > stored_hi + interval:
+                    download_end = end_ms
 
         if already_covered:
             return {

@@ -1,5 +1,6 @@
 """Main CLI application for Crypto Quant Terminal."""
 
+import json
 import sys
 from typing import Optional
 from pathlib import Path
@@ -869,8 +870,15 @@ def paper(
     end: Optional[str] = typer.Option(None, "--end", help="End date (YYYY-MM-DD)"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="HTML report path (report action)"),
     live: bool = typer.Option(False, "--live", help="Run a live polling loop instead of replay"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="Data mode: replay or realtime (defaults to replay unless --live)"),
     poll: Optional[float] = typer.Option(None, "--poll", help="Poll interval in seconds (live)"),
     window: int = typer.Option(300, "--window", help="Warmup bars held for live signal generation"),
+    capital: Optional[float] = typer.Option(None, "--capital", help="Starting capital override ($)"),
+    leverage: Optional[int] = typer.Option(None, "--leverage", "-l", help="Leverage (futures only, 1-5x)"),
+    risk_per_trade: Optional[float] = typer.Option(None, "--risk-per-trade", help="Risk fraction per trade (e.g., 0.01 = 1%)"),
+    max_positions: Optional[int] = typer.Option(None, "--max-positions", help="Max open positions (e.g., 3)"),
+    detach: bool = typer.Option(False, "--detach", "-d", help="Run realtime worker in background (detached process)"),
+    resume: Optional[str] = typer.Option(None, "--resume", help="Resume paper account from run ID"),
 ):
     """Paper trading commands (simulated execution, never a real order)."""
     console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
@@ -878,11 +886,15 @@ def paper(
     console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
 
     config = get_config()
+    resolved_mode = mode or ("realtime" if live else "replay")
 
     if action == "start":
         paper_start(
             strategy=strategy, symbol=symbol, timeframe=timeframe, market=market,
-            start=start, end=end, config=config, live=live, poll=poll, window=window,
+            start=start, end=end, config=config, live=(resolved_mode == "realtime"),
+            poll=poll, window=window, capital=capital, leverage=leverage,
+            risk_per_trade=risk_per_trade, max_positions=max_positions,
+            detach=detach, resume=resume,
         )
     elif action == "status":
         paper_status(config)
@@ -914,7 +926,7 @@ def _fee_rate_for(config, market: str) -> float:
 
 def _run_one_session(strategy, symbol, timeframe, market, start, end, config,
                      persist: bool = True):
-    """Load stored data and run a deterministic replay paper session.
+    """Run a deterministic replay paper session via the worker.
 
     Args:
         persist: When True, write the session's trades to the database (used by
@@ -923,58 +935,96 @@ def _run_one_session(strategy, symbol, timeframe, market, start, end, config,
     """
     db = get_db_manager()
     db.create_tables()
-    repo = MarketDataRepository(db)
 
     strat_types = [s.strip() for s in (strategy or "trend").split(",")]
     if len(strat_types) != 1:
         console.print("[bold red]Paper trading uses exactly one strategy type.[/bold red]")
         raise typer.Abort()
-    strat_obj = create_strategy(strat_types[0])
+    strat = strat_types[0]
 
-    start_ms = _parse_date_ms(start) or _parse_date_ms(config.data.start_date)
-    end_ms = _parse_date_ms(end) or _parse_date_ms(config.data.end_date)
-    df = repo.load(symbol, timeframe, start_ms, end_ms, market_type=market)
-    if df is None or len(df) < 60:
+    from ..execution.worker import LiveTradingWorker, WorkerConfig
+    wcfg = WorkerConfig(
+        strategy=strat, symbol=symbol, timeframe=timeframe,
+        market_type=market, mode="replay",
+        start=start, end=end,
+        starting_capital=float(config.risk.starting_capital),
+        risk_per_trade=float(config.risk.risk_per_trade),
+        max_open_positions=int(config.risk.max_open_positions),
+        leverage=int(config.risk.max_leverage) if market == "futures" else 1,
+        persist=persist,
+    )
+    try:
+        worker = LiveTradingWorker(config=wcfg, db=db)
+    except ValueError as exc:
         console.print(f"[bold red]Not enough data for {symbol} {timeframe}. Run `data download` first.[/bold red]")
         raise typer.Abort()
 
-    fee_rate = _fee_rate_for(config, market)
-    broker = PaperBroker(
-        price_source=DataframePriceSource(df),
-        starting_capital=config.risk.starting_capital,
-        fee_rate=fee_rate,
-        slippage=config.fees.slippage,
-        market_type=market,
-    )
-    risk = RiskManager(RiskLimits.from_config(config.risk))
-    cfg = PaperTradingConfig(
-        symbol=symbol, market_type=market, timeframe=timeframe,
-        starting_capital=config.risk.starting_capital,
-        fee_rate=fee_rate, slippage=config.fees.slippage,
-    )
-    engine = PaperTradingEngine(strategy=strat_obj, broker=broker,
-                                risk_manager=risk, config=cfg,
-                                db=db if persist else None)
     console.print(f"[bold]Symbol:[/bold] {symbol} | [bold]TF:[/bold] {timeframe} | "
-                  f"[bold]Market:[/bold] {market} | [bold]Strategy:[/bold] {strat_obj.strategy_type}")
-    result = engine.run_bars(df)
-    return result, strat_obj, broker, risk
+                  f"[bold]Market:[/bold] {market} | [bold]Strategy:[/bold] {strat}")
+    result = worker.run_replay()
+    return result, worker.strategy, worker.broker, worker.risk
 
 
 def paper_start(strategy, symbol, timeframe, market, start, end, config,
-                live: bool = False, poll: Optional[float] = None, window: int = 300):
-    """Start a paper trading session: deterministic replay, or a live loop with --live."""
+                live: bool = False, poll: Optional[float] = None, window: int = 300,
+                capital: Optional[float] = None, leverage: Optional[int] = None,
+                risk_per_trade: Optional[float] = None, max_positions: Optional[int] = None,
+                detach: bool = False, resume: Optional[str] = None):
+    """Start a paper trading session: deterministic replay, or a realtime loop."""
+    import subprocess
     db = get_db_manager()
     db.create_tables()
 
-    if live:
-        _run_live_paper(strategy=strategy, symbol=symbol, timeframe=timeframe,
-                        market=market, config=config, db=db, poll=poll, window=window)
+    strat = (strategy or "trend").strip()
+    cap = capital if capital is not None else float(config.risk.starting_capital)
+    rpt = risk_per_trade if risk_per_trade is not None else float(config.risk.risk_per_trade)
+    mpos = max_positions if max_positions is not None else int(config.risk.max_open_positions)
+    lev = leverage if leverage is not None else (int(config.risk.max_leverage) if market == "futures" else 1)
+    poll_s = int(poll or _LIVE_WAIT_S.get(timeframe, 60))
+
+    if detach and live:
+        # Run worker as a detached background process (STEP 5).
+        args = [
+            sys.executable, "-m", "crypto_quant.execution.worker",
+            "--strategy", strat, "--symbol", symbol, "--timeframe", timeframe,
+            "--market", market, "--mode", "realtime",
+            "--capital", str(cap), "--risk-per-trade", str(rpt),
+            "--max-positions", str(mpos), "--leverage", str(lev),
+            "--poll", str(poll_s), "--window", str(window),
+        ]
+        if resume:
+            args += ["--resume", resume]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        console.print(f"[bold green]✓[/bold green] Realtime paper worker detached (pid={proc.pid}).")
+        console.print("Run `paper status` to view live state, `paper stop` to shut down.")
         return
 
-    result, strat_obj, broker, risk = _run_one_session(
-        strategy, symbol, timeframe, market, start, end, config)
-    _print_paper_result(result, strat_obj.strategy_type)
+    from ..execution.worker import LiveTradingWorker, WorkerConfig
+    wcfg = WorkerConfig(
+        strategy=strat, symbol=symbol, timeframe=timeframe,
+        market_type=market, mode="realtime" if live else "replay",
+        start=start, end=end, starting_capital=cap,
+        risk_per_trade=rpt, max_open_positions=mpos, leverage=lev,
+        poll_interval=poll_s, window=window, resume=resume,
+    )
+    try:
+        worker = LiveTradingWorker(config=wcfg, db=db)
+    except ValueError:
+        console.print(f"[bold red]Not enough data for {symbol} {timeframe}. Run `data download` first.[/bold red]")
+        raise typer.Abort()
+
+    if not live:
+        console.print(f"[bold]Symbol:[/bold] {symbol} | [bold]TF:[/bold] {timeframe} | "
+                      f"[bold]Market:[/bold] {market} | [bold]Strategy:[/bold] {strat} | "
+                      f"[bold]Mode:[/bold] REPLAY")
+        result = worker.run_replay()
+        _print_paper_result(result, strat)
+    else:
+        console.print(f"[bold cyan]Realtime paper session started ({wcfg.run_id})[/bold cyan]")
+        console.print(f"[bold]Symbol:[/bold] {symbol} | [bold]TF:[/bold] {timeframe} | "
+                      f"[bold]Market:[/bold] {market} | [bold]Poll:[/bold] {poll_s}s")
+        console.print("[dim]Run `paper stop` from another shell or press Ctrl+C to stop.[/dim]")
+        worker.run_loop()
 
 
 def _print_paper_result(result, strat_type: str) -> None:
@@ -1000,25 +1050,41 @@ def _print_paper_result(result, strat_type: str) -> None:
 
 
 def paper_status(config) -> None:
-    """Show a live session (if any) plus recent persisted paper trades."""
+    """Show the full live account surface: balance, equity, unrealized/realized PnL,
+    open positions, trades, win rate, drawdown, exposure, risk status, last feed ts.
+    """
     from datetime import datetime as _dt, timezone as _tz
+    import json
     db = get_db_manager()
     db.create_tables()
 
-    session_path = _paper_session_path()
-    if session_path.exists():
-        try:
-            import json
-            state = json.loads(session_path.read_text(encoding="utf-8"))
-        except Exception:
-            state = {}
-        if state.get("phase") == "running":
-            console.print("[bold cyan]Active live paper session:[/bold cyan]")
-            for k in ("run_id", "symbol", "timeframe", "market_type", "strategy", "started_at", "last_seen"):
-                if state.get(k):
-                    console.print(f"  [cyan]{k}:[/cyan] {state[k]}")
-            console.print(f"  [cyan]equity:[/cyan] {state.get('equity')}  [cyan]n_trades:[/cyan] {state.get('n_trades')}")
+    from ..execution.persistence import load_account_snapshot
+    from ..execution.worker import WorkerLock
 
+    lock_info = WorkerLock.current()
+    acct = load_account_snapshot(db, any_status=True)
+
+    # 1. Worker process status
+    state_table = Table(title="Worker Status", show_header=True)
+    state_table.add_column("Property", style="cyan")
+    state_table.add_column("Value", style="green")
+    if lock_info:
+        state_table.add_row("Process State", "[bold green]RUNNING[/bold green]")
+        state_table.add_row("PID", str(lock_info.get("pid", "-")))
+        state_table.add_row("Run ID", str(lock_info.get("run_id", "-")))
+        state_table.add_row("Started At", str(lock_info.get("started_at", "-")))
+    else:
+        state_table.add_row("Process State", "[yellow]STOPPED[/yellow]")
+    if acct is not None:
+        state_table.add_row("Last Run ID", acct.run_id)
+        state_table.add_row("Market / Mode", f"{acct.symbol} {acct.timeframe} ({acct.market_type}) • {acct.mode.upper()}")
+        state_table.add_row("Strategy", acct.strategy)
+        if acct.last_market_ts:
+            ts_str = _dt.fromtimestamp(acct.last_market_ts / 1000, tz=_tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            state_table.add_row("Last Market Feed", ts_str)
+    console.print(state_table)
+
+    # 2. Account summary (from PaperAccount or ExecutionTrade aggregation)
     s = db.get_session()
     try:
         rows = (s.query(ExecutionTrade)
@@ -1028,24 +1094,72 @@ def paper_status(config) -> None:
     finally:
         s.close()
 
-    if not rows:
-        console.print("[yellow]No paper trades yet. Run: python -m crypto_quant paper start[/yellow]")
-        return
-
     pnls = [r.net_pnl or 0.0 for r in rows]
     realized = sum(pnls)
     wins = sum(1 for p in pnls if p > 0)
-    capital = float(config.risk.starting_capital)
+    capital = float(acct.initial_capital) if acct else float(config.risk.starting_capital)
+    cash = float(acct.cash) if acct else capital + realized
+    equity = float(acct.equity) if acct else capital + realized
+
+    positions = []
+    risk_info = {}
+    if acct and acct.positions:
+        try:
+            positions = json.loads(acct.positions)
+        except Exception:
+            positions = []
+    if acct and acct.risk_status:
+        try:
+            risk_info = json.loads(acct.risk_status)
+        except Exception:
+            risk_info = {}
+
+    unrealized = equity - cash
+    drawdown = float(risk_info.get("drawdown", 0.0))
+    exposure = sum(abs(float(p.get("entry_price", 0)) * float(p.get("quantity", 0))) for p in positions)
+    kill_switch = risk_info.get("kill_switch", False)
 
     summary = Table(title="Paper Account Summary", show_header=True)
     summary.add_column("Metric", style="cyan")
     summary.add_column("Value", justify="right", style="green")
     summary.add_row("Starting Capital", f"${capital:,.2f}")
-    summary.add_row("Realized PnL (paper)", f"${realized:,.2f}")
-    summary.add_row("Est. Paper Equity", f"${capital + realized:,.2f}")
+    summary.add_row("Balance (Cash)", f"${cash:,.2f}")
+    summary.add_row("Unrealized PnL", f"${unrealized:+,.2f}")
+    summary.add_row("Realized PnL", f"${realized:+,.2f}")
+    summary.add_row("Total Equity", f"${equity:,.2f}")
+    summary.add_row("Current Drawdown", f"{drawdown:.2%}")
+    summary.add_row("Current Exposure", f"${exposure:,.2f}")
+    summary.add_row("Open Positions", str(len(positions)))
     summary.add_row("Closed Trades", str(len(rows)))
     summary.add_row("Win Rate", f"{(wins / len(rows)):.1%}" if rows else "n/a")
+    summary.add_row("Risk Status", "[red]KILL SWITCH ACTIVE[/red]" if kill_switch else "[green]NORMAL[/green]")
     console.print(summary)
+
+    # 3. Open positions
+    if positions:
+        pos_table = Table(title="Open Positions", show_header=True)
+        pos_table.add_column("Symbol", style="magenta")
+        pos_table.add_column("Side", style="white")
+        pos_table.add_column("Qty", justify="right")
+        pos_table.add_column("Entry Price", justify="right")
+        pos_table.add_column("Stop Loss", justify="right")
+        pos_table.add_column("Take Profit", justify="right")
+        pos_table.add_column("Leverage", justify="right")
+        for p in positions:
+            pos_table.add_row(
+                p.get("symbol", "-"), p.get("side", "-"),
+                f"{float(p.get('quantity', 0)):.4f}",
+                f"{float(p.get('entry_price', 0)):.4f}",
+                f"{float(p.get('stop_loss', 0)):.4f}" if p.get("stop_loss") else "-",
+                f"{float(p.get('take_profit', 0)):.4f}" if p.get("take_profit") else "-",
+                f"{p.get('leverage', 1)}x",
+            )
+        console.print(pos_table)
+
+    # 4. Recent closed trades
+    if not rows:
+        console.print("[yellow]No paper trades yet. Run: python -m crypto_quant paper start[/yellow]")
+        return
 
     table = Table(title="Recent Paper Trades", show_header=True)
     table.add_column("ID", style="cyan")
@@ -1060,10 +1174,8 @@ def paper_status(config) -> None:
     for r in rows[:20]:
         color = "green" if (r.net_pnl or 0) >= 0 else "red"
         reason = r.exit_reason or "-"
-        symbol = r.symbol
-        side = r.direction
         table.add_row(
-            r.id, symbol, side,
+            r.id, r.symbol, r.direction,
             f"{r.entry_price:.4f}", f"{r.exit_price:.4f}" if r.exit_price else "-",
             f"{r.quantity:.4f}", f"[{color}]{r.net_pnl:.4f}[/{color}]",
             reason,
@@ -1073,11 +1185,11 @@ def paper_status(config) -> None:
 
 
 def paper_stop() -> None:
-    """Request a stop for a live session; replay sessions close automatically."""
+    """Safely stop any active paper worker process and persist state."""
+    import json
     session_path = _paper_session_path()
     if session_path.exists():
         try:
-            import json
             state = json.loads(session_path.read_text(encoding="utf-8"))
         except Exception:
             state = {}
@@ -1086,6 +1198,16 @@ def paper_stop() -> None:
             session_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
             console.print("[yellow]Stop requested. The live session will shut down on its next tick and persist.[/yellow]")
             return
+
+    from ..execution.worker import LiveTradingWorker, WorkerLock
+    lock = WorkerLock.current()
+    if lock:
+        worker = LiveTradingWorker()
+        worker.stop()
+        console.print(f"[yellow]Stop signaled to worker pid={lock.get('pid')} (run={lock.get('run_id')}).[/yellow]")
+        console.print("[green]The worker will finalize, close positions, persist, and release its lock.[/green]")
+        return
+
     console.print("[yellow]No active live paper session to stop. Replay sessions close & persist automatically.[/yellow]")
 
 
@@ -1256,18 +1378,262 @@ def _paper_menu(config) -> None:
 
 
 @app.command()
-def live(
-    action: str = typer.Argument(..., help="Action: start, stop, status"),
-    strategy: Optional[str] = typer.Option(None, "--strategy", "-s", help="Strategy ID"),
-    dry_run: bool = typer.Option(True, "--dry-run", help="Enable dry run"),
+def worker(
+    strategy: str = typer.Option("trend", "--strategy", "-s", help="Strategy type"),
+    symbol: str = typer.Option("BTCUSDT", "--symbol", help="Symbol"),
+    timeframe: str = typer.Option("1h", "--timeframe", "-t", help="Timeframe"),
+    market: str = typer.Option("spot", "--market", "-m", help="spot or futures"),
+    mode: str = typer.Option("replay", "--mode", help="replay or realtime"),
+    start: Optional[str] = typer.Option(None, "--start", help="Start date"),
+    end: Optional[str] = typer.Option(None, "--end", help="End date"),
+    capital: float = typer.Option(1000.0, "--capital", help="Starting capital"),
+    risk_per_trade: float = typer.Option(0.01, "--risk-per-trade", help="Risk fraction"),
+    max_positions: int = typer.Option(3, "--max-positions", help="Max positions"),
+    leverage: int = typer.Option(1, "--leverage", "-l", help="Leverage"),
+    poll: int = typer.Option(60, "--poll", help="Poll interval"),
+    run_id: str = typer.Option("", "--run-id", help="Session ID"),
+    resume: Optional[str] = typer.Option(None, "--resume", help="Resume run ID"),
 ):
-    """Live trading commands."""
-    console.print("[bold cyan]Live Trading[/bold cyan]")
-    console.print(f"Action: {action}")
-    if strategy:
-        console.print(f"Strategy: {strategy}")
-    console.print(f"Dry Run: {dry_run}")
-    console.print("[yellow]Coming in Phase 13[/yellow]")
+    """Direct worker daemon entry point (subprocesses / detached runs)."""
+    from ..execution.worker import LiveTradingWorker, WorkerConfig
+    db = get_db_manager()
+    db.create_tables()
+    cfg = WorkerConfig(
+        strategy=strategy, symbol=symbol, timeframe=timeframe,
+        market_type=market, mode=mode, start=start, end=end,
+        starting_capital=capital, risk_per_trade=risk_per_trade,
+        max_open_positions=max_positions, leverage=leverage,
+        poll_interval=poll, run_id=run_id, resume=resume,
+    )
+    w = LiveTradingWorker(config=cfg, db=db)
+    w.run()
+
+
+@app.command()
+def live(
+    action: str = typer.Argument(..., help="Action: start, stop, status, pause, resume, kill, reconcile, orders, positions"),
+    strategy: str = typer.Option("trend", "--strategy", "-s", help="Strategy: trend, momentum, mean_reversion, breakout"),
+    symbol: str = typer.Option("BTCUSDT", "--symbol", help="Trading pair symbol (e.g. BTCUSDT)"),
+    timeframe: str = typer.Option("1h", "--timeframe", "-t", help="Bar timeframe (e.g. 1h, 15m)"),
+    market: str = typer.Option("spot", "--market", "-m", help="Market type: spot or futures"),
+    testnet: bool = typer.Option(True, "--testnet/--live-net", help="Use Binance Testnet (True) or Live Real Money (False)"),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Dry-run simulation mode (no real orders)"),
+    confirm: Optional[str] = typer.Option(None, "--confirm", help="Confirmation string for non-interactive live execution"),
+    capital: Optional[float] = typer.Option(None, "--capital", help="Starting capital ($)"),
+    risk_per_trade: Optional[float] = typer.Option(0.01, "--risk-per-trade", help="Risk fraction (0.01 = 1%)"),
+    max_positions: Optional[int] = typer.Option(3, "--max-positions", help="Maximum simultaneous open positions"),
+    leverage: Optional[int] = typer.Option(1, "--leverage", "-l", help="Futures leverage (1-5x)"),
+    poll: Optional[int] = typer.Option(60, "--poll", help="Poll interval in seconds"),
+):
+    """Production live trading execution commands (Binance Spot & Futures)."""
+    import os
+    from ..exchange.binance_live import BinanceLiveConnector
+    from ..execution.live_broker import BinanceLiveBroker
+    from ..execution.live_worker import LiveExecutionWorker, LiveWorkerConfig
+    from ..execution.safety import LiveSafetyGateKeeper, PositionReconciler
+    from ..risk.limits import RiskLimits
+    from ..risk.manager import RiskManager
+
+    config = get_config()
+    db = get_db_manager()
+    db.create_tables()
+
+    env_label = "DRY_RUN (Simulation)" if dry_run else ("BINANCE TESTNET" if testnet else "BINANCE LIVE (REAL MONEY)")
+    console.print(f"[bold cyan]──────────────────────────────────────────────[/bold cyan]")
+    console.print(f"[bold cyan]       BINANCE LIVE TRADING: {env_label}[/bold cyan]")
+    console.print(f"[bold cyan]──────────────────────────────────────────────[/bold cyan]")
+
+    api_key = os.environ.get("BINANCE_API_KEY", "")
+    api_secret = os.environ.get("BINANCE_API_SECRET", "")
+
+    connector = BinanceLiveConnector(
+        api_key=api_key,
+        api_secret=api_secret,
+        market_type=market,
+        testnet=testnet,
+    )
+    broker = BinanceLiveBroker(
+        connector=connector,
+        dry_run=dry_run,
+        default_leverage=leverage or 1,
+    )
+    limits = RiskLimits(
+        starting_capital=capital or float(config.risk.starting_capital),
+        risk_per_trade=risk_per_trade or float(config.risk.risk_per_trade),
+        max_open_positions=max_positions or int(config.risk.max_open_positions),
+        max_leverage=leverage or 1,
+    )
+    risk = RiskManager(limits)
+
+    if action == "start":
+        # DOUBLE CONFIRMATION FOR REAL MONEY
+        if not dry_run and not testnet:
+            console.print("\n[bold red]╔════════════════════════════════════════════════════════════╗[/bold red]")
+            console.print("[bold red]║  CRITICAL WARNING: REAL MONEY LIVE TRADING IS REQUESTED   ║[/bold red]")
+            console.print("[bold red]║  REAL CAPITAL IS AT RISK ON BINANCE PRODUCTION EXCHANGE    ║[/bold red]")
+            console.print("[bold red]╚════════════════════════════════════════════════════════════╝[/bold red]\n")
+
+            required_phrase = "START LIVE TRADING"
+            if confirm != required_phrase:
+                user_input = Prompt.ask(f"To confirm real-money live trading, type exactly '[bold red]{required_phrase}[/bold red]'")
+                if user_input.strip() != required_phrase:
+                    console.print("[bold yellow]Live trading start ABORTED: confirmation mismatch.[/bold yellow]")
+                    raise typer.Abort()
+
+        # Gate Verification
+        gate_res = LiveSafetyGateKeeper.verify_all_gates(
+            connector=connector,
+            broker=broker,
+            risk=risk,
+            db=db,
+            strategy_name=strategy,
+            symbol=symbol,
+            dry_run=dry_run,
+            is_live_flag=(not dry_run and not testnet),
+        )
+        if not gate_res.all_passed:
+            console.print("[bold red]LIVE TRADING START REFUSED! Safety gates failed:[/bold red]")
+            for f in gate_res.failure_reasons:
+                console.print(f"  [red]✗[/red] {f}")
+            raise typer.Abort()
+
+        console.print("[bold green]✓ All 15 Safety Gates Passed Successfully.[/bold green]")
+        console.print(f"Starting live execution worker on [bold]{symbol}[/bold] ({market.upper()}) using [bold]{strategy}[/bold]...")
+
+        wcfg = LiveWorkerConfig(
+            strategy=strategy,
+            symbol=symbol,
+            timeframe=timeframe,
+            market_type=market,
+            testnet=testnet,
+            dry_run=dry_run,
+            is_live_flag=(not dry_run and not testnet),
+            starting_capital=capital or float(config.risk.starting_capital),
+            risk_per_trade=risk_per_trade or float(config.risk.risk_per_trade),
+            max_open_positions=max_positions or int(config.risk.max_open_positions),
+            leverage=leverage or 1,
+            poll_interval=poll or 60,
+        )
+        worker = LiveExecutionWorker(
+            config=wcfg,
+            connector=connector,
+            broker=broker,
+            risk=risk,
+            db=db,
+        )
+        worker.run()
+
+    elif action == "status":
+        from ..db.models import LiveAccount, LiveOrder
+        s = db.get_session()
+        try:
+            acct = s.query(LiveAccount).order_by(LiveAccount.updated_at.desc()).first()
+            orders = s.query(LiveOrder).order_by(LiveOrder.created_at.desc()).limit(10).all()
+        finally:
+            s.close()
+
+        table = Table(title="Live Trading Operational Status", show_header=True)
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        if acct:
+            table.add_row("Run ID", acct.run_id)
+            table.add_row("Environment", acct.environment.upper())
+            table.add_row("Status", f"[bold green]{acct.status.upper()}[/bold green]" if acct.status == "running" else f"[yellow]{acct.status.upper()}[/yellow]")
+            table.add_row("Symbol / TF", f"{acct.symbol} {acct.timeframe} ({acct.market_type})")
+            table.add_row("Strategy", acct.strategy)
+            table.add_row("Equity", f"${acct.equity:,.2f}")
+            table.add_row("Cash Balance", f"${acct.cash:,.2f}")
+            table.add_row("Closed Trades", str(acct.closed_trades))
+        else:
+            table.add_row("Status", "[yellow]NO ACTIVE SESSION[/yellow]")
+        console.print(table)
+
+        if orders:
+            o_table = Table(title="Recent Live Orders", show_header=True)
+            o_table.add_column("Order ID", style="cyan")
+            o_table.add_column("Symbol", style="magenta")
+            o_table.add_column("Side", style="white")
+            o_table.add_column("Qty", justify="right")
+            o_table.add_column("Fill Price", justify="right")
+            o_table.add_column("Status", style="yellow")
+            for o in orders:
+                o_table.add_row(
+                    o.id[:18], o.symbol, o.side.upper(),
+                    f"{o.requested_qty:.4f}",
+                    f"${o.avg_fill_price:.4f}" if o.avg_fill_price else "-",
+                    f"[green]{o.status}[/green]" if o.status == "filled" else o.status,
+                )
+            console.print(o_table)
+
+    elif action == "stop":
+        session_path = Path("data/live_session.json")
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(json.dumps({"stop_requested": True}, indent=2), encoding="utf-8")
+        console.print("[yellow]Stop signal dispatched. Live worker will gracefully finalize on next tick.[/yellow]")
+
+    elif action == "kill":
+        risk.emergency_stop(close_positions=True)
+        session_path = Path("data/live_session.json")
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(json.dumps({"stop_requested": True, "kill_switch": True}, indent=2), encoding="utf-8")
+        console.print("[bold red]EMERGENCY KILL SWITCH ENGAGED! New trades halted and positions flagged for closure.[/bold red]")
+
+    elif action == "reconcile":
+        reconciler = PositionReconciler(connector, broker)
+        is_clean, discrepancies = reconciler.reconcile()
+        if is_clean:
+            console.print("[bold green]✓ Local state matches Binance exchange state perfectly (0 discrepancies).[/bold green]")
+        else:
+            console.print(f"[bold red]✗ {len(discrepancies)} Discrepancies detected:[/bold red]")
+            for d in discrepancies:
+                console.print(f"  [red]•[/red] [{d.category}] {d.message}")
+
+    elif action == "positions":
+        positions = broker.get_positions()
+        if not positions:
+            console.print("[yellow]No open positions found.[/yellow]")
+        else:
+            pos_table = Table(title="Open Positions", show_header=True)
+            pos_table.add_column("Symbol", style="cyan")
+            pos_table.add_column("Side", style="white")
+            pos_table.add_column("Quantity", justify="right")
+            pos_table.add_column("Entry Price", justify="right")
+            pos_table.add_column("Notional", justify="right")
+            pos_table.add_column("Leverage", justify="right")
+            for p in positions:
+                pos_table.add_row(
+                    p.get("symbol", "-"), p.get("side", "-"),
+                    f"{float(p.get('quantity', 0)):.4f}",
+                    f"${float(p.get('entry_price', 0)):.4f}",
+                    f"${float(p.get('notional', 0)):.2f}",
+                    f"{p.get('leverage', 1)}x",
+                )
+            console.print(pos_table)
+
+    elif action == "orders":
+        orders = broker.orders
+        if not orders:
+            console.print("[yellow]No orders in current session.[/yellow]")
+        else:
+            o_table = Table(title="Session Orders", show_header=True)
+            o_table.add_column("ID", style="cyan")
+            o_table.add_column("Symbol", style="magenta")
+            o_table.add_column("Side", style="white")
+            o_table.add_column("Qty", justify="right")
+            o_table.add_column("Status", style="yellow")
+            o_table.add_column("Fill Price", justify="right")
+            o_table.add_column("Message")
+            for o in orders:
+                o_table.add_row(
+                    o.order_id, o.symbol, o.side,
+                    f"{o.quantity:.4f}", o.status,
+                    f"${o.fill_price:.4f}" if o.fill_price else "-",
+                    o.message[:40] if o.message else "-",
+                )
+            console.print(o_table)
+    else:
+        console.print(f"[bold red]Unknown live action:[/bold red] {action}. Expected: start, stop, status, kill, reconcile, orders, positions")
 
 
 @app.command()

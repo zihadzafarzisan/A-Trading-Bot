@@ -277,6 +277,7 @@ class ExecutionTrade(Base):
     execution_mode = Column(String(20), nullable=False)  # paper, live
     symbol = Column(String(20), nullable=False)
     market_type = Column(String(10), nullable=False)
+    timeframe = Column(String(10))
     direction = Column(String(10), nullable=False)
     entry_time = Column(Integer, nullable=False)
     exit_time = Column(Integer)
@@ -284,6 +285,11 @@ class ExecutionTrade(Base):
     exit_price = Column(Float)
     quantity = Column(Float, nullable=False)
     leverage = Column(Integer, nullable=False, default=1)
+    stop_loss = Column(Float)
+    take_profit = Column(Float)
+    fees = Column(Float, default=0)
+    funding = Column(Float, default=0)
+    gross_pnl = Column(Float)
     order_ids = Column(Text)  # JSON array of exchange order IDs
     status = Column(String(20), nullable=False, default="open")  # open, closed, cancelled
     net_pnl = Column(Float)
@@ -291,3 +297,111 @@ class ExecutionTrade(Base):
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     strategy = relationship("Strategy", backref="execution_trades")
+
+
+class PaperAccount(Base):
+    """Persisted paper account + worker state snapshot for status & recovery.
+
+    One row per paper run. The worker upserts it every tick so `paper status`
+    shows accurate live account state and a later run can recover the account
+    (cash, positions) instead of silently starting over.
+    """
+    __tablename__ = "paper_accounts"
+
+    run_id = Column(String(50), primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    timeframe = Column(String(10), nullable=False)
+    market_type = Column(String(10), nullable=False)
+    strategy = Column(String(50), nullable=False)
+    mode = Column(String(20), nullable=False, default="replay")  # replay/realtime
+    initial_capital = Column(Float, nullable=False)
+    cash = Column(Float, nullable=False)
+    equity = Column(Float, nullable=False)
+    positions = Column(Text)          # JSON: open positions
+    closed_trades = Column(Integer, nullable=False, default=0)
+    worker_state = Column(Text)       # JSON: run flags, bars/signals/orders, peak equity
+    risk_status = Column(Text)        # JSON: drawdown/exposure/kill-switch/events
+    last_market_ts = Column(Integer)
+    status = Column(String(20), nullable=False, default="running")  # running/stopped
+    started_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        Index("ix_paper_accounts_updated", "updated_at"),
+    )
+
+
+class LiveAccount(Base):
+    """Persisted live/testnet/dry-run account + worker state snapshot.
+
+    Tracks live balances, equity, positions, risk status, environment (LIVE/TESTNET/DRY_RUN),
+    and exchange synchronization metrics.
+    """
+    __tablename__ = "live_accounts"
+
+    run_id = Column(String(50), primary_key=True)
+    environment = Column(String(20), nullable=False)  # live, testnet, dry_run
+    symbol = Column(String(20), nullable=False)
+    timeframe = Column(String(10), nullable=False)
+    market_type = Column(String(10), nullable=False)
+    strategy = Column(String(50), nullable=False)
+    initial_capital = Column(Float, nullable=False)
+    cash = Column(Float, nullable=False)
+    equity = Column(Float, nullable=False)
+    positions = Column(Text)          # JSON: open positions
+    closed_trades = Column(Integer, nullable=False, default=0)
+    worker_state = Column(Text)       # JSON: orders placed, signals, error count
+    risk_status = Column(Text)        # JSON: drawdown, daily/weekly loss, kill switch
+    last_market_ts = Column(Integer)
+    status = Column(String(20), nullable=False, default="running")  # running/stopped/halted
+    started_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        Index("ix_live_accounts_updated", "updated_at"),
+    )
+
+
+class LiveOrder(Base):
+    """Complete audit record of every order placed to Binance or Dry-Run."""
+    __tablename__ = "live_orders"
+
+    id = Column(String(64), primary_key=True)  # client_order_id
+    exchange_order_id = Column(String(64))
+    run_id = Column(String(50), nullable=False)
+    environment = Column(String(20), nullable=False)  # live, testnet, dry_run
+    strategy_id = Column(String(50), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    market_type = Column(String(10), nullable=False)
+    side = Column(String(10), nullable=False)  # buy, sell
+    order_type = Column(String(20), nullable=False)  # market, limit
+    requested_qty = Column(Float, nullable=False)
+    executed_qty = Column(Float, default=0.0)
+    requested_price = Column(Float)
+    avg_fill_price = Column(Float)
+    fee = Column(Float, default=0.0)
+    status = Column(String(20), nullable=False)  # new, filled, partially_filled, rejected, canceled
+    rejection_reason = Column(Text)
+    latency_ms = Column(Float)
+    idempotency_key = Column(String(64))
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        Index("ix_live_orders_symbol", "symbol"),
+        Index("ix_live_orders_status", "status"),
+        Index("ix_live_orders_created", "created_at"),
+    )
+
+
+class ReconciliationEvent(Base):
+    """Audit record of reconciliation checks and any detected discrepancies."""
+    __tablename__ = "reconciliation_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(50), nullable=False)
+    timestamp = Column(DateTime, default=utc_now, nullable=False)
+    is_clean = Column(Boolean, nullable=False)
+    discrepancies = Column(Text)  # JSON array of discrepancies
+    action_taken = Column(String(50))  # e.g. "halted_trading", "synced"
+

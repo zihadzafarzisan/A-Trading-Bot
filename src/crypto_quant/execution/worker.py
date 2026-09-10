@@ -1,491 +1,562 @@
-"""Live trading worker.
+"""Live/paper trading worker (orchestration layer).
 
-Orchestrates the live trading pipeline (spec #57):
+Thin process + lifecycle layer on top of the existing ``PaperTradingEngine``.
+It does NOT re-implement entry/sizing/SL-TP logic — that all lives in
+``execution/engine.py`` through the ``RiskManager`` and ``PaperBroker``. This
+worker only:
 
-    Market Data -> Signal Engine -> Risk Engine -> Live Execution
-               -> Portfolio -> Database -> Dashboard
+  - builds strategy / broker / risk manager / engine from config,
+  - drives two data modes (replay over stored history, realtime over Binance),
+  - persists the paper account snapshot every bar,
+  - runs the standalone monitoring agent,
+  - manages the worker lifecycle and process lock (duplicate/stale/graceful stop).
 
-Architecture: single-threaded poll loop with configurable interval.
-Supports both PaperBroker (dry-run) and LiveBroker (go-live).
+PAPER-ONLY SAFETY: the worker only ever constructs a ``PaperBroker`` and will
+pass it to a ``PaperTradingEngine`` that rejects any non-paper broker. There is
+no code path from here to a live order.
 
 Usage as script:
-    python worker.py --symbol BTCUSDT --strategy momentum --dry-run
+    python -m crypto_quant worker --symbol BTCUSDT --strategy trend \
+        --mode replay --start 2025-01-01 --end 2025-03-01
+    python -m crypto_quant worker --mode realtime --leading-run 1
 
 Usage as import:
-    worker = LiveTradingWorker(strategy=..., broker=..., risk_manager=...)
-    worker.run_loop()
+    worker = LiveTradingWorker(WorkerConfig(mode="replay", ...), db=db)
+    worker.run_replay()
 """
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..logging_config import get_logger
+from ..strategies import create_strategy
+from ..risk.limits import RiskLimits
 from ..risk.manager import RiskManager
-from ..strategies.base import BaseStrategy, Direction, Signal
-from .broker import Order, PriceSource, AdapterPriceSource, CallbackPriceSource
+from .broker import AdapterPriceSource, CallbackPriceSource, PriceSource
+from .engine import DataframePriceSource, PaperTradingConfig, PaperTradingEngine
 from .paper import PaperBroker
-from .standalone_agent import StandaloneAgent, StandaloneAgentConfig
+from .persistence import load_account_snapshot, restore_broker_state, save_account_snapshot
+from .standalone_agent import StandaloneAgent
 
 logger = get_logger("trading")
 
+_PAPER_LOCK_PATH = Path("data/paper_worker.lock")
+
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & state
 # ---------------------------------------------------------------------------
 @dataclass
 class WorkerConfig:
-    """Configuration for the live trading worker."""
+    """Configuration for the paper trading worker (never live)."""
 
+    strategy: str = "trend"
     symbol: str = "BTCUSDT"
     timeframe: str = "1h"
     market_type: str = "spot"
     starting_capital: float = 1000.0
+    risk_per_trade: float = 0.01
+    max_open_positions: int = 3
+    max_leverage: float = 5.0
     fee_rate: float = 0.001
     slippage: float = 0.0005
     max_holding_bars: Optional[int] = None
-    poll_interval: int = 60  # seconds between market data polls
-    dry_run: bool = True  # default to paper trading
+    poll_interval: int = 60           # seconds between realtime polls
+    leverage: int = 1                 # futures leverage (spot is 1x)
+    auto_emergency_stop: bool = False  # kill switch on daily-loss breach
+    mode: str = "replay"              # 'replay' | 'realtime'
+    start: Optional[str] = None       # replay start (YYYY-MM-DD or ms)
+    end: Optional[str] = None         # replay end
+    run_id: str = ""                  # session id; auto-generated if empty
+    resume: Optional[str] = None      # db run_id to restore account from
+    window: int = 300                 # warmup bars for realtime signal generation
+    persist: bool = True              # whether to persist trades/snapshots to DB
 
 
 @dataclass
 class WorkerState:
-    """Mutable state for the worker loop."""
+    """Mutable, persisted-able state for the worker loop."""
 
     is_running: bool = False
     bars_processed: int = 0
     signals_generated: int = 0
     orders_placed: int = 0
     last_bar_time: Optional[int] = None
+    last_equity: float = 0.0
+    consecutive_errors: int = 0
+    last_seen: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Live Trading Worker
+# Process lock (duplicate prevention + stale detection)
+# ---------------------------------------------------------------------------
+class WorkerLock:
+    """A simple PID + heartbeat lock preventing two workers on one portfolio.
+
+    Duplicate prevention: if the lock exists and its heartbeat is fresh, another
+    worker is live → refuse. Stale detection: if the heartbeat is old, the owner
+    died (or was killed) → reclaim. The owner refreshes the heartbeat each loop
+    and releases (deletes) the lock on graceful shutdown.
+    """
+
+    def __init__(self, path: Path = _PAPER_LOCK_PATH, heartbeat_s: float = 30.0):
+        self.path = Path(path)
+        self.heartbeat_s = heartbeat_s
+        self._owned = False
+
+    def acquire(self, run_id: str = "") -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if self.path.exists() and data:
+            last = float(data.get("last_seen", 0.0))
+            if now - last < self.heartbeat_s:
+                # A live owner holds the lock -> duplicate worker.
+                logger.error(
+                    "[PAPER MODE] duplicate worker blocked: lock owned by pid=%s run=%s",
+                    data.get("pid"), data.get("run_id"))
+                return False
+            # stale lock -> reclaim
+            logger.warning("[PAPER MODE] reclaiming stale worker lock (owner pid=%s)",
+                           data.get("pid"))
+        self.path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "run_id": run_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "last_seen": now,
+        }, indent=2), encoding="utf-8")
+        self._owned = True
+        return True
+
+    def heartbeat(self) -> None:
+        """Refresh the heartbeat so other starts see this worker as live."""
+        if not self._owned:
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+            data["last_seen"] = time.time()
+            if "pid" not in data:
+                data["pid"] = os.getpid()
+            self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def release(self) -> None:
+        if self._owned:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._owned = False
+
+    @classmethod
+    def current(cls, path: Path = _PAPER_LOCK_PATH) -> Optional[Dict[str, Any]]:
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+
+# ---------------------------------------------------------------------------
+# The worker
 # ---------------------------------------------------------------------------
 class LiveTradingWorker:
-    """Orchestrates the live trading pipeline.
-
-    Connects to market data feed, runs strategies, and executes via broker.
-    Supports single strategy or registry-based loading.
-    """
+    """Orchestrates the paper pipeline by delegating to the PaperTradingEngine."""
 
     def __init__(
         self,
-        strategy: BaseStrategy,
-        broker,
-        risk_manager: RiskManager,
         config: Optional[WorkerConfig] = None,
-        exchange_adapter=None,
-        monitor: Optional[StandaloneAgent] = None,
+        db=None,
+        monitoring: Optional[StandaloneAgent] = None,
+        adapter=None,
+        lock: Optional[WorkerLock] = None,
     ):
-        """Initialize the worker.
-
-        Args:
-            strategy: The strategy generating signals.
-            broker: PaperBroker or LiveBroker instance.
-            risk_manager: RiskManager gating every entry.
-            config: Worker configuration.
-            exchange_adapter: ExchangeAdapter for market data.
-            monitor: Optional monitoring agent for alerts.
-        """
         self.config = config or WorkerConfig()
-        self.strategy = strategy
-        self.broker = broker
-        self.risk = risk_manager
-        self.exchange_adapter = exchange_adapter
-        self.monitor = monitor
+        if not self.config.run_id:
+            self.config.run_id = f"PAPER-{int(time.time() * 1000)}"
+        self.db = db
+        self.monitor = monitoring
+        self.adapter = adapter
+        self.lock = lock or WorkerLock()
 
-        # State
+        self.strategy, self.broker, self.risk, self.engine = self._build()
         self.state = WorkerState()
+        logger.info("[PAPER MODE] worker initialized run=%s mode=%s symbol=%s %s "
+                    "strategy=%s market=%s",
+                    self.config.run_id, self.config.mode, self.config.symbol,
+                    self.config.timeframe, self.config.strategy, self.config.market_type)
 
-        # Internal
-        self._pending_signal: Optional[Signal] = None
-        self._price_history: List[Dict[str, float]] = []
-        self._max_history: int = 1000
+    # ------------------------------------------------------------ construction
+    def _build(self):
+        strat_obj = create_strategy(self.config.strategy)
+        limits = RiskLimits(
+            starting_capital=self.config.starting_capital,
+            risk_per_trade=self.config.risk_per_trade,
+            max_open_positions=self.config.max_open_positions,
+            max_leverage=self.config.max_leverage,
+        )
+        risk = RiskManager(limits)
+        market = self.config.market_type
+        cfg = PaperTradingConfig(
+            symbol=self.config.symbol,
+            market_type=market,
+            timeframe=self.config.timeframe,
+            starting_capital=self.config.starting_capital,
+            fee_rate=self.config.fee_rate,
+            slippage=self.config.slippage,
+            max_holding_bars=self.config.max_holding_bars,
+            leverage=self.config.leverage,
+            auto_emergency_stop=self.config.auto_emergency_stop,
+        )
 
-    # ------------------------------------------------------------------ public API
-    def run_once(self) -> Optional[Dict[str, Any]]:
-        """Run a single iteration of the trading loop.
+        if self.config.mode == "realtime":
+            source = DataframePriceSource(_empty_frame())
+            # Realtime polls fetch fresh windows; the price source is swapped in
+            # poll_once() so the engine sees the new closes.
+            self._realtime_frame = []
+        else:
+            df = self._load_replay_data(cfg)
+            if df is None or len(df) < 2:
+                raise ValueError(
+                    f"[PAPER MODE] not enough stored data for {self.config.symbol} "
+                    f"{self.config.timeframe}. Run `data download` first.")
+            source = DataframePriceSource(df)
+            self._replay_df = df
 
-        Returns:
-            Dict with iteration results, or None if no action taken.
-        """
-        if self.state.is_running:
-            logger.warning("Worker already running")
+        broker = PaperBroker(
+            price_source=source,
+            starting_capital=self.config.starting_capital,
+            fee_rate=self.config.fee_rate,
+            slippage=self.config.slippage,
+            market_type=market,
+        )
+
+        # Optional restart recovery: restore a prior account from the DB.
+        if self.config.resume and self.db is not None:
+            row = load_account_snapshot(self.db, self.config.resume, any_status=True)
+            if row is not None:
+                restore_broker_state(broker, row)
+                logger.info("[PAPER MODE] recovered account run=%s equity=%.2f",
+                            row.run_id, row.equity)
+
+        engine = PaperTradingEngine(
+            strategy=strat_obj, broker=broker, risk_manager=risk,
+            config=cfg, db=self.db if self.config.persist else None,
+        )
+        return strat_obj, broker, risk, engine
+
+    def _load_replay_data(self, cfg):
+        from ..data.repository import MarketDataRepository
+        start_ms = _parse_date_ms(self.config.start)
+        end_ms = _parse_date_ms(self.config.end)
+        repo = MarketDataRepository(self.db)
+        df = repo.load(self.config.symbol, self.config.timeframe,
+                       start_ms, end_ms, market_type=cfg.market_type)
+        if df is None:
             return None
+        return df.reset_index(drop=True)
 
+    # ------------------------------------------------------------ MODE A: replay
+    def run_replay(self) -> Any:
+        """Deterministically replay stored bars through the paper pipeline."""
+        logger.info("[PAPER MODE] starting replay run=%s (%s -> %s)",
+                    self.config.run_id, self.config.start, self.config.end)
+        result = self.engine.run_bars(self._replay_df)
         self.state.is_running = True
-        result = None
-
-        try:
-            # 1. Fetch market data
-            bar = self._fetch_bar()
-            if bar is None:
-                return None
-
-            # 2. Manage existing positions (SL/TP)
-            self._manage_exits(bar)
-
-            # 3. Generate signal
-            signal = self._generate_signal(bar)
-
-            # 4. Process pending entry from previous bar
-            if self._pending_signal is not None:
-                entry_result = self._enter(self._pending_signal, bar["open"], bar["timestamp"])
-                self._pending_signal = None
-
-            # 5. Queue signal for next bar
-            if signal is not None and signal.is_active:
-                self._pending_signal = signal
-                self.state.signals_generated += 1
-
-            # 6. Snapshot equity
-            self.broker.mark_positions(bar["timestamp"])
-
-            self.state.bars_processed += 1
-            self.state.last_bar_time = bar["timestamp"]
-
-            result = {
-                "bar": bar,
-                "signal": signal.to_dict() if signal else None,
-                "equity": self.broker.equity,
-                "positions": self.broker.get_positions(),
-            }
-
-        except Exception as e:
-            logger.error("Worker iteration failed: %s", e)
-        finally:
-            self.state.is_running = False
-
+        self.state.bars_processed = len(self._replay_df)
+        self.state.last_equity = float(self.broker.equity)
+        self.state.last_bar_time = (
+            int(self._replay_df["timestamp"].iloc[-1])
+            if len(self._replay_df) else None)
+        self.state.is_running = False
+        # Persist final account snapshot + risk events.
+        self._snapshot(status="stopped")
+        if self.db is not None:
+            self._persist_risk()
+        logger.info("[PAPER MODE] replay finished run=%s trades=%d equity=%.2f",
+                    self.config.run_id, result.n_trades, result.final_equity)
         return result
 
-    def run_loop(self) -> None:
-        """Run continuous trading loop."""
-        logger.info(
-            "Starting live trading worker (symbol=%s, strategy=%s, dry_run=%s, interval=%ds)",
-            self.config.symbol,
-            self.strategy.name,
-            self.config.dry_run,
-            self.config.poll_interval,
-        )
+    # ------------------------------------------------------------ MODE B: realtime
+    def _ensure_adapter(self):
+        if self.adapter is not None:
+            return self.adapter
+        from ..exchange.binance import BinanceAdapter
+        self.adapter = BinanceAdapter(market_type=self.config.market_type)
+        return self.adapter
 
+    def _fetch_frame(self) -> Optional[Any]:
+        """Pull the latest completed-bar window from the real feed."""
+        import pandas as pd
+        adapter = self._ensure_adapter()
         try:
+            df = adapter.get_ohlcv_as_dataframe(
+                self.config.symbol, self.config.timeframe, limit=self.config.window)
+        except Exception as exc:  # noqa: BLE001
+            self.state.consecutive_errors += 1
+            logger.warning("[PAPER MODE] feed error (%d): %s",
+                           self.state.consecutive_errors, exc)
+            return None
+        if df is None or df.empty:
+            self.state.consecutive_errors += 1
+            return None
+        self.state.consecutive_errors = 0
+        return df.reset_index(drop=True)
+
+    def on_new_bar(self, df) -> Dict[str, Any]:
+        """Process one newly completed bar from the feed through the engine."""
+        src = self.broker.price_source
+        src.df = df
+        src.set_index(len(df) - 1)
+        # Live: the engine queues the current signal for its next on_bar so both
+        # replay and realtime share the exact same risk-gated execution path.
+        prepared = self.strategy.setup(df)
+        signal = self.strategy.generate_signal(prepared, len(df) - 1)
+        self.engine.set_live_signal(signal)
+        bar = {
+            "open": float(df["open"].iloc[-1]),
+            "high": float(df["high"].iloc[-1]),
+            "low": float(df["low"].iloc[-1]),
+            "close": float(df["close"].iloc[-1]),
+            "timestamp": int(df["timestamp"].iloc[-1]),
+        }
+        self.engine.on_bar(bar)
+        self.state.bars_processed += 1
+        self.state.last_bar_time = bar["timestamp"]
+        self.state.last_equity = float(self.broker.equity)
+        self._snapshot()
+        return bar
+
+    def run_loop(self) -> None:
+        """Realtime polling loop with graceful stop / Ctrl+C handling."""
+        return self._realtime_loop()
+
+    def _realtime_loop(self) -> None:
+        logger.info("[PAPER MODE] realtime loop run=%s poll=%ss", self.config.run_id,
+                    self.config.poll_interval)
+        adapter = self._ensure_adapter()
+        last_ts = None
+        try:
+            df = self._fetch_frame()
+            if df is not None:
+                last_ts = int(df["timestamp"].iloc[-1])
             while True:
-                result = self.run_once()
-                if result:
-                    logger.debug(
-                        "Iteration %d: equity=%.2f, positions=%d",
-                        self.state.bars_processed,
-                        result["equity"],
-                        len(result["positions"]),
-                    )
                 time.sleep(self.config.poll_interval)
+                self.lock.heartbeat()
+                df = self._fetch_frame()
+                if df is None or self.state.consecutive_errors > 3:
+                    if self.state.consecutive_errors > 3:
+                        logger.critical("[PAPER MODE] data feed disconnected (feed alert)")
+                    continue
+                ts = int(df["timestamp"].iloc[-1])
+                if ts == last_ts:
+                    continue
+                last_ts = ts
+                try:
+                    self.on_new_bar(df)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("[PAPER MODE] bar processing error (does not stop loop): %s", exc)
+                if self._monitor_step():
+                    pass
+                if self._stop_flagged():
+                    logger.info("[PAPER MODE] stop requested; finalizing")
+                    break
         except KeyboardInterrupt:
-            logger.info("Worker stopped by user")
-            self._cleanup()
+            logger.info("[PAPER MODE] interrupted by user")
+        finally:
+            self._shutdown(adapter=adapter, reason="live_stop")
+
+    # ------------------------------------------------------------ lifecycle
+    def run(self) -> Any:
+        """Execute the configured mode and block until done/stopped."""
+        if self.config.mode == "replay":
+            if not self.lock.acquire(self.config.run_id):
+                raise RuntimeError("another worker is holding the lock; refusing to start")
+            try:
+                return self.run_replay()
+            finally:
+                self.lock.release()
+        return self.run_loop()
 
     def stop(self) -> None:
-        """Stop the worker gracefully."""
-        logger.info("Stopping worker...")
-        self._cleanup()
+        """Signal a graceful stop for a background worker."""
+        self._write_stop_flag()
 
-    # ------------------------------------------------------------------ market data
-    def _fetch_bar(self) -> Optional[Dict[str, float]]:
-        """Fetch latest market data bar."""
-        if self.exchange_adapter is None:
-            logger.error("No exchange adapter configured")
-            return None
-
+    def _shutdown(self, adapter=None, reason: str = "session_end") -> None:
+        """Finalize: close positions, persist, release lock, close adapter."""
         try:
-            df = self.exchange_adapter.get_ohlcv_as_dataframe(
-                self.config.symbol, self.config.timeframe, limit=1
-            )
-            if df is None or df.empty:
-                logger.warning("No data returned for %s", self.config.symbol)
-                return None
+            if self.broker.positions:
+                self.broker.close_all(reason=reason)
+                self.broker.mark_positions(int(time.time() * 1000))
+            self.risk.update_equity(self.broker.equity)
+            result = self.engine._result()
+            if self.db is not None and self.config.persist:
+                self.engine._persist(result)
+                self._persist_risk()
+            self._snapshot(status="stopped", last_market_ts=self.state.last_bar_time)
+            logger.info("[PAPER MODE] finalized run=%s trades=%d equity=%.2f",
+                        self.config.run_id, result.n_trades, result.final_equity)
+        finally:
+            self.lock.release()
+            if adapter is not None:
+                try:
+                    adapter.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self._clear_stop_flag()
+            except Exception:  # noqa: BLE001
+                pass
 
-            bar = {
-                "open": float(df["open"].iloc[-1]),
-                "high": float(df["high"].iloc[-1]),
-                "low": float(df["low"].iloc[-1]),
-                "close": float(df["close"].iloc[-1]),
-                "volume": float(df["volume"].iloc[-1]),
-                "timestamp": int(df["timestamp"].iloc[-1]) if "timestamp" in df.columns else int(time.time() * 1000),
-            }
+    # ------------------------------------------------------------ persistence
+    def _snapshot(self, status: str = "running",
+                  last_market_ts: Optional[int] = None) -> None:
+        if self.db is None or not self.config.persist:
+            return
+        save_account_snapshot(
+            self.db,
+            run_id=self.config.run_id,
+            config=self.engine.config,
+            broker=self.broker,
+            risk=self.risk,
+            strategy=self.config.strategy,
+            worker_state={
+                "bars_processed": self.state.bars_processed,
+                "signals": self.state.signals_generated,
+                "orders": self.state.orders_placed,
+                "last_bar_time": self.state.last_bar_time,
+            },
+            status=status,
+            last_market_ts=last_market_ts if last_market_ts is not None else self.state.last_bar_time,
+        )
 
-            # Update price history
-            self._price_history.append(bar)
-            if len(self._price_history) > self._max_history:
-                self._price_history.pop(0)
+    def _persist_risk(self) -> None:
+        if not self.config.persist:
+            return
+        from .persistence import persist_risk_events
+        persist_risk_events(self.db, self.risk)
 
-            return bar
-
-        except Exception as e:
-            logger.error("Failed to fetch bar for %s: %s", self.config.symbol, e)
-            return None
-
-    # ------------------------------------------------------------------ strategy
-    def _generate_signal(self, bar: Dict[str, float]) -> Optional[Signal]:
-        """Generate trading signal from current bar."""
+    # ------------------------------------------------------------ monitoring
+    def _monitor_step(self) -> bool:
+        if self.monitor is None:
+            return False
         try:
-            # Build DataFrame from price history for strategy
-            import pandas as pd
-            if len(self._price_history) < 2:
-                return None
+            alerts = self.monitor.run_once()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("monitor step failed: %s", exc)
+            return False
+        if alerts:
+            for a in alerts:
+                logger.warning("[PAPER MODE][monitor][%s] %s", a.level, a.message)
+        return bool(alerts)
 
-            df = pd.DataFrame(self._price_history)
-            if "timestamp" not in df.columns:
-                df["timestamp"] = range(len(df))
+    # ------------------------------------------------------------ stop signal
+    def _stop_flag_path(self) -> Path:
+        return Path("data/paper_session.json")
 
-            prepared = self.strategy.setup(df)
-            signal = self.strategy.generate_signal(prepared, len(prepared) - 1)
-            return signal
-
-        except Exception as e:
-            logger.error("Signal generation failed: %s", e)
-            return None
-
-    # ------------------------------------------------------------------ execution
-    def _enter(self, signal: Signal, bar_open: float, bar_time: int) -> Optional[Dict[str, Any]]:
-        """Risk-gate, size, and place an entry order."""
-        if not signal.is_active:
-            return None
-
-        if self.config.market_type == "spot" and signal.direction == Direction.SHORT:
-            return None
-
-        if signal.stop_loss is None:
-            return None
-
-        equity = self.broker.equity
-
-        # Risk check
-        check = self.risk.check_entry(
-            equity=equity,
-            open_positions=len(self.broker.get_positions()),
-            leverage=1,
-            symbol=self.config.symbol,
-        )
-        if not check.is_allowed:
-            logger.debug("Entry rejected: %s", check.reasons)
-            return None
-
-        # Position sizing
+    def _stop_flagged(self) -> bool:
         try:
-            sizing = self.risk.size_position(
-                equity=equity,
-                entry_price=bar_open,
-                stop_price=signal.stop_loss,
-                direction=signal.direction.value,
-                market_type=self.config.market_type,
-                leverage=1,
-            )
-        except ValueError:
-            return None
+            data = json.loads(self._stop_flag_path().read_text(encoding="utf-8"))
+            return bool(data.get("stop_requested"))
+        except (OSError, json.JSONDecodeError):
+            return False
 
-        # Place order
-        side = "buy" if signal.direction == Direction.LONG else "sell"
-        order = Order(
-            order_id=f"live_{self.state.orders_placed}",
-            symbol=self.config.symbol,
-            side=side,
-            quantity=sizing.quantity,
-            order_type="market",
-        )
-        self.broker.place_order(order)
-        self.state.orders_placed += 1
+    def _write_stop_flag(self) -> None:
+        p = self._stop_flag_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        data["stop_requested"] = True
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-        # Attach stop/take levels to position
-        if order.status == "filled":
-            positions = self.broker.get_positions()
-            for pos in positions:
-                if pos.get("symbol") == self.config.symbol:
-                    pos["stop_loss"] = signal.stop_loss
-                    pos["take_profit"] = signal.take_profit
-                    break
-
-        return {"order": order.order_id, "side": side, "quantity": sizing.quantity}
-
-    def _manage_exits(self, bar: Dict[str, float]) -> None:
-        """Close positions whose stop/take was touched this bar."""
-        positions = self.broker.get_positions()
-        for pos in list(positions):
-            symbol = pos.get("symbol")
-            sl = pos.get("stop_loss")
-            tp = pos.get("take_profit")
-            side = pos.get("side")
-            quantity = pos.get("quantity", 0)
-
-            if side not in ("long", "short"):
-                continue
-
-            hit_sl = (side == "long" and sl is not None and bar["low"] <= sl) or \
-                     (side == "short" and sl is not None and bar["high"] >= sl)
-            hit_tp = (side == "long" and tp is not None and bar["high"] >= tp) or \
-                     (side == "short" and tp is not None and bar["low"] <= tp)
-
-            fill = None
-            reason = None
-            if hit_sl and hit_tp:
-                fill, reason = sl, "sl"
-            elif hit_sl:
-                fill = min(bar["open"], sl) if side == "long" else max(bar["open"], sl)
-                reason = "sl"
-            elif hit_tp:
-                fill = max(bar["open"], tp) if side == "long" else min(bar["open"], tp)
-                reason = "tp"
-
-            if fill is not None:
-                # Update price source for fill
-                if hasattr(self.broker, "price_source"):
-                    self.broker.price_source.set_price(fill)
-
-                order = Order(
-                    order_id=f"live_exit_{self.state.orders_placed}",
-                    symbol=symbol,
-                    side="sell" if side == "long" else "buy",
-                    quantity=quantity,
-                    order_type="market",
-                )
-                self.broker.place_order(order)
-                self.state.orders_placed += 1
-
-                # Record exit reason
-                if self.broker.closed_trades:
-                    self.broker.closed_trades[-1]["exit_reason"] = reason
-                    self.broker.closed_trades[-1]["exit_time"] = bar.get("timestamp")
-
-    # ------------------------------------------------------------------ cleanup
-    def _cleanup(self) -> None:
-        """Clean up resources on shutdown."""
-        logger.info(
-            "Worker stats: bars=%d, signals=%d, orders=%d",
-            self.state.bars_processed,
-            self.state.signals_generated,
-            self.state.orders_placed,
-        )
+    def _clear_stop_flag(self) -> None:
+        p = self._stop_flag_path()
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Registry support
+# helpers
 # ---------------------------------------------------------------------------
-def load_strategy_from_registry(
-    registry,
-    strategy_name: str,
-    symbol: str,
-    timeframe: str,
-) -> Optional[BaseStrategy]:
-    """Load a strategy from the strategy registry.
+def _empty_frame():
+    import pandas as pd
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    Args:
-        registry: StrategyRegistry instance.
-        strategy_name: Name of the strategy to load.
-        symbol: Trading symbol.
-        timeframe: Timeframe for the strategy.
 
-    Returns:
-        Configured strategy instance, or None if not found.
-    """
+def _parse_date_ms(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    if value.isdigit():
+        return int(value)
+    from datetime import datetime as _dt
     try:
-        strategy_cls = registry.get(strategy_name)
-        if strategy_cls is None:
-            logger.error("Strategy '%s' not found in registry", strategy_name)
-            return None
-        return strategy_cls(symbol=symbol, timeframe=timeframe)
-    except Exception as e:
-        logger.error("Failed to load strategy '%s': %s", strategy_name, e)
+        return int(_dt.strptime(value, "%Y-%m-%d").timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def load_strategy_from_registry(registry, strategy_name: str, symbol: str,
+                                timeframe: str):
+    """Back-compat shim: load a strategy from the registry (kept for imports)."""
+    try:
+        from ..strategies import create_strategy
+        return create_strategy(strategy_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to load strategy '%s': %s", strategy_name, exc)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Script entry point
+# Script / subprocess entry point
 # ---------------------------------------------------------------------------
-def main():
-    """Run live trading worker."""
+def main(argv: Optional[List[str]] = None) -> None:
+    """Run the paper worker (used directly or as a detached subprocess)."""
     import argparse
+    parser = argparse.ArgumentParser(description="Paper trading worker (never live)")
+    parser.add_argument("--strategy", type=str, default="trend")
+    parser.add_argument("--symbol", type=str, default="BTCUSDT")
+    parser.add_argument("--timeframe", type=str, default="1h")
+    parser.add_argument("--market", type=str, choices=["spot", "futures"], default="spot")
+    parser.add_argument("--mode", type=str, choices=["replay", "realtime"], default="replay")
+    parser.add_argument("--start", type=str, default=None)
+    parser.add_argument("--end", type=str, default=None)
+    parser.add_argument("--capital", type=float, default=1000.0)
+    parser.add_argument("--risk-per-trade", type=float, default=0.01)
+    parser.add_argument("--max-positions", type=int, default=3)
+    parser.add_argument("--leverage", type=int, default=1)
+    parser.add_argument("--auto-emergency-stop", action="store_true", default=False)
+    parser.add_argument("--poll", type=int, default=60)
+    parser.add_argument("--run-id", type=str, default="")
+    parser.add_argument("--resume", type=str, default=None)
+    args = parser.parse_args(argv)
 
-    parser = argparse.ArgumentParser(description="Live trading worker")
-    parser.add_argument("--symbol", type=str, default="BTCUSDT", help="Trading symbol")
-    parser.add_argument("--strategy", type=str, default="momentum", help="Strategy name")
-    parser.add_argument("--timeframe", type=str, default="1h", help="Timeframe")
-    parser.add_argument("--interval", type=int, default=60, help="Poll interval in seconds")
-    parser.add_argument("--capital", type=float, default=1000.0, help="Starting capital")
-    parser.add_argument("--dry-run", action="store_true", default=True, help="Paper trading mode (default)")
-    parser.add_argument("--live", action="store_true", help="Live trading mode (use with caution)")
-    parser.add_argument("--monitor", action="store_true", help="Enable monitoring agent")
-    args = parser.parse_args()
+    from ..db.connection import get_db_manager
+    db = get_db_manager()
+    db.create_tables()
 
-    # Import here to avoid circular imports
-    from ..strategies.registry import StrategyRegistry
-    from ..risk.manager import RiskManager
-    from .paper import PaperBroker
-    from .broker import AdapterPriceSource
-
-    # Determine broker based on mode
-    dry_run = not args.live
-
-    # Create adapter (placeholder - in production, pass real adapter)
-    adapter = None  # Would be BinanceAdapter in production
-
-    # Create price source
-    price_source = AdapterPriceSource(adapter) if adapter else None
-
-    # Create broker
-    broker = PaperBroker(
-        price_source=price_source,
-        initial_capital=args.capital,
-        fee_rate=0.001,
-        slippage=0.0005,
+    cfg = WorkerConfig(
+        strategy=args.strategy, symbol=args.symbol, timeframe=args.timeframe,
+        market_type=args.market, mode=args.mode, start=args.start, end=args.end,
+        starting_capital=args.capital, risk_per_trade=args.risk_per_trade,
+        max_open_positions=args.max_positions, leverage=args.leverage,
+        auto_emergency_stop=args.auto_emergency_stop,
+        poll_interval=args.poll, run_id=args.run_id, resume=args.resume,
     )
-
-    # Load strategy
-    registry = StrategyRegistry()
-    strategy = load_strategy_from_registry(
-        registry, args.strategy, args.symbol, args.timeframe
-    )
-    if strategy is None:
-        logger.error("Failed to load strategy, exiting")
-        return
-
-    # Create risk manager
-    risk_manager = RiskManager()
-
-    # Create worker config
-    config = WorkerConfig(
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        starting_capital=args.capital,
-        poll_interval=args.interval,
-        dry_run=dry_run,
-    )
-
-    # Create worker
-    worker = LiveTradingWorker(
-        strategy=strategy,
-        broker=broker,
-        risk_manager=risk_manager,
-        config=config,
-        exchange_adapter=adapter,
-    )
-
-    # Optionally attach monitoring agent
-    if args.monitor:
-        monitor_config = StandaloneAgentConfig(
-            symbols=[args.symbol],
-            timeframe=args.timeframe,
-        )
-        monitor = StandaloneAgent(
-            exchange_adapter=adapter,
-            price_source=price_source,
-            broker=broker,
-            config=monitor_config,
-        )
-        worker.monitor = monitor
-
-    # Run
-    mode = "DRY-RUN" if dry_run else "LIVE"
-    logger.info("Starting worker in %s mode", mode)
-    worker.run_loop()
+    worker = LiveTradingWorker(config=cfg, db=db)
+    worker.run()
 
 
 if __name__ == "__main__":
