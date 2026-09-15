@@ -68,6 +68,14 @@ _URL_HOST_RE = re.compile(r"https?://[a-z0-9.-]*\.binance\.com")
 # (``fapi``/``dapi``/``eapi``/``papi`` or a demo/testnet host).
 _SPOT_HOST_RE = re.compile(r"https?://api[0-9]*\.binance\.com")
 
+# Mirror hosts that respond immediately when the primary api.binance.com is
+# slow or suffers TLS handshake timeouts (observed from certain environments).
+_SPOT_MIRROR_HOSTS: tuple[str, ...] = (
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+)
+
 
 @dataclass
 class CarryOpportunity:
@@ -422,36 +430,72 @@ def _build_spot_client(timeout_ms: int = _REQUEST_TIMEOUT_MS, load: bool = True)
     Returns a `ccxt.binance` handle pinned to Spot endpoints with no API
     credentials attached (public scanner -> must never carry an apiKey, so a
     stale/invalid key can never surface a 401/`Invalid API-key` at launch).
-    ``load_markets`` is retried once before degrading to the empty-cache
-    fallback, so a single transient blip does not silently starve the scan.
+
+    ``load_markets`` is retried across the primary host and each Binance mirror
+    host (``api[1-3].binance.com``) before degrading to the empty-cache
+    fallback, so a single transient blip or a TLS timeout on the primary host
+    does not silently starve the scan.
     """
     import ccxt
 
-    spot = ccxt.binance({
-        "apiKey": None,
-        "secret": None,
-        "enableRateLimit": True,
-        "timeout": timeout_ms,
-        "options": {
-            "fetchCurrencies": False,
-            "defaultType": "spot",
-            "disableFuturesSandboxWarning": True,
-        },
-    })
-    _pin_spot_urls(spot)
-    if not load:
+    def _new() -> "ccxt.binance":
+        client = ccxt.binance({
+            "apiKey": None,
+            "secret": None,
+            "enableRateLimit": True,
+            "timeout": timeout_ms,
+            "options": {
+                "fetchCurrencies": False,
+                "defaultType": "spot",
+                "fetchMarkets": ["spot"],  # load Spot markets only, no derivative fetches here
+                "disableFuturesSandboxWarning": True,
+            },
+        })
+        _pin_spot_urls(client)
+        return client
+
+    def _try_base() -> "ccxt.binance":
+        spot = _new()
+        spot.load_markets()
         return spot
+
+    def _try_mirror(host: str) -> "ccxt.binance":
+        spot = _new()
+        # Rewrite the hostname of every Spot URL group (api.binance.com/
+        # api[1-3].binance.com) to the requested mirror, preserving the path
+        # (e.g. ``https://api<b>.binance.com/api/v3``) so ``load_markets``
+        # resolves against the mirror instead of the primary host.
+        api = spot.urls.get("api", {})
+        for group, url in api.items():
+            swapped = _SPOT_HOST_RE.sub(host, url) if isinstance(url, str) else url
+            api[group] = swapped
+        spot.load_markets()
+        return spot
+
+    if not load:
+        return _new()
+
     last_error: Optional[Exception] = None
-    for attempt in (1, 2):
+
+    # Attempt 1: the primary api.binance.com host.
+    try:
+        return _try_base()
+    except Exception as exc:  # noqa: BLE001 - classified below
+        last_error = exc
+        time.sleep(1.0)
+
+    # Attempts 2-4: each mirror host, which respond immediately where the
+    # primary suffers intermittent TLS handshake timeouts.
+    for host in _SPOT_MIRROR_HOSTS:
         try:
-            spot.load_markets()
-            return spot
+            return _try_mirror(host)
         except Exception as exc:  # noqa: BLE001 - classified below
             last_error = exc
-            if attempt == 1:
-                time.sleep(1.0)
+            logger.warning("Spot market load failed on mirror %s; trying next: %s", host, exc)
+            time.sleep(1.0)
+
     logger.warning("Spot market load failed; continuing with empty cache: %s", last_error)
-    return spot
+    return _new()
 
 
 def _try_demo_usdm(common):
