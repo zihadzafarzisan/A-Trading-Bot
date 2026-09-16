@@ -137,6 +137,49 @@ def adx(
     return adx_series.fillna(0.0)
 
 
+def dmi(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+    shift: int = 1,
+) -> Tuple[pd.Series, pd.Series]:
+    """Directional Movement Indicators (+DI, -DI).
+
+    Returns:
+        Tuple of (plus_di, minus_di) Series.
+    """
+    if period <= 0:
+        raise ValueError("period must be > 0")
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=high.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=high.index,
+    )
+
+    tr = _true_range(high, low)
+    atr = _wilder_rma(tr, period)
+
+    plus_di = 100 * _wilder_rma(plus_dm, period) / atr.replace(0, np.nan)
+    minus_di = 100 * _wilder_rma(minus_dm, period) / atr.replace(0, np.nan)
+
+    plus_di = plus_di.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    minus_di = minus_di.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if shift:
+        plus_di = plus_di.shift(shift)
+        minus_di = minus_di.shift(shift)
+
+    return plus_di, minus_di
+
+
 def trend_slope(
     series: pd.Series,
     period: int = 20,

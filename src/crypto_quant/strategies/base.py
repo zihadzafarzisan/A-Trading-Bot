@@ -18,7 +18,7 @@ Design contract
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -210,6 +210,44 @@ class BaseStrategy(ABC):
             return entry_price + reward
         return entry_price - reward
 
+    # ------------------------------------------------------- fill-time anchoring
+    def prepare_fill(
+        self,
+        df: pd.DataFrame,
+        signal_bar_index: int,
+        direction: Direction,
+        actual_fill_price: float,
+        sig: Optional[Signal] = None,
+    ) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
+        """Derive deterministic risk state for an entry at the given fill price.
+
+        Called by the engine AFTER the actual fill price is known (post-slippage).
+        Returns ``(stop_loss, take_profit, extra_state)``.
+
+        Default (legacy) behavior: keep the stop/take that generate_signal()
+        already computed, and carry no extra state. Strategies that must
+        re-anchor stop/take to the real fill price (dynamic stop families)
+        override this.
+        """
+        if sig is not None:
+            return sig.stop_loss, sig.take_profit, {}
+        return None, None, {}
+
+    # ------------------------------------------------------------ stop management
+    def update_stop(
+        self,
+        df: pd.DataFrame,
+        bar_index: int,
+        position,
+    ) -> None:
+        """Per-bar stop management; called after the close of ``bar_index``.
+
+        Default no-op. Strategies with dynamic stops (ATR trailing, breakeven)
+        override to set ``position.active_stop``, ``position.risk_r``, or
+        ``position.breakeven_active``. Effective one bar delayed.
+        """
+        return
+
     # ------------------------------------------------------------ filters
     def apply_filters(self, df: pd.DataFrame, i: int, context: Optional[Dict] = None) -> bool:
         """Return True if the bar passes the strategy-level filters.
@@ -287,7 +325,7 @@ class BaseStrategy(ABC):
             "supports_short": self.supports_short,
             "params": dict(self.params),
             "stop_spec": {
-                "type": self.stop_spec.stop_type.value,
+                "type": self.stop_spec.stop_type.value if hasattr(self.stop_spec.stop_type, "value") else str(self.stop_spec.stop_type),
                 "atr_multiplier": self.stop_spec.atr_multiplier,
                 "percent": self.stop_spec.percent,
                 "swing_lookback": self.stop_spec.swing_lookback,

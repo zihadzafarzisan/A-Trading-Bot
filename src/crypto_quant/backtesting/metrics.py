@@ -266,9 +266,11 @@ class MetricsCalculator:
             return np.array([])
         eq = np.asarray(equity, dtype=float)
         prev = eq[:-1]
-        prev = np.where(prev == 0, np.nan, prev)
-        returns = eq[1:] / prev - 1.0
-        return returns[~np.isnan(returns)]
+        valid = (prev > 0) & (eq[1:] > 0)
+        if not valid.any():
+            return np.array([])
+        # Continuously compounded log returns eliminate arithmetic compounding distortion
+        return np.log(eq[1:][valid] / prev[valid])
 
     def _sharpe(self, returns: np.ndarray) -> float:
         if len(returns) < 2:

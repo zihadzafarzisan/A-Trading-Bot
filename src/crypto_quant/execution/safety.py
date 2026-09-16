@@ -87,13 +87,14 @@ class LiveSafetyGateKeeper:
 
         # Gate 1: LIVE_TRADING_ENABLED env var or explicit flag
         env_enabled = os.environ.get("LIVE_TRADING_ENABLED", "").lower() in ("true", "1", "yes")
-        # In dry run mode, Gate 1 passes by definition of simulation
-        gate1_passed = dry_run or (env_enabled and is_live_flag)
+        # In dry run or testnet mode, Gate 1 passes (only real money LIVE mode requires the explicit live flag)
+        is_testnet = bool(connector and connector.testnet)
+        gate1_passed = dry_run or is_testnet or (env_enabled and is_live_flag)
         add_gate(
             1,
             "LIVE_TRADING_ENABLED Flag",
             gate1_passed,
-            "Live trading explicitly enabled"
+            "Live trading or Testnet explicitly enabled"
             if gate1_passed
             else "LIVE_TRADING_ENABLED environment variable or flag is False",
         )
@@ -311,9 +312,10 @@ class ReconciliationDiscrepancy:
 class PositionReconciler:
     """Reconciles local database / broker records with live Binance exchange balances & positions."""
 
-    def __init__(self, connector: BinanceLiveConnector, broker: BinanceLiveBroker):
+    def __init__(self, connector: BinanceLiveConnector, broker: BinanceLiveBroker, symbol: Optional[str] = None):
         self.connector = connector
         self.broker = broker
+        self.symbol = symbol.upper() if symbol else None
         self.discrepancies: List[ReconciliationDiscrepancy] = []
 
     def reconcile(self) -> Tuple[bool, List[ReconciliationDiscrepancy]]:
@@ -329,12 +331,15 @@ class PositionReconciler:
 
         try:
             # 1. Fetch remote exchange state
-            remote_positions = self.connector.get_positions()
+            remote_positions = self.connector.get_positions(symbol=self.symbol)
             remote_pos_map = {p["symbol"]: p for p in remote_positions if abs(p["position_amt"]) > 0}
 
-            # 2. Fetch local broker state
+            # 2. Fetch local broker state (filtered to the strategy's target symbol if specified)
             local_positions = self.broker.get_positions()
-            local_pos_map = {p["symbol"]: p for p in local_positions}
+            if self.symbol:
+                local_pos_map = {p["symbol"]: p for p in local_positions if p["symbol"] == self.symbol}
+            else:
+                local_pos_map = {p["symbol"]: p for p in local_positions}
 
             # 3. Check for mismatches
             all_symbols = set(remote_pos_map.keys()).union(set(local_pos_map.keys()))
@@ -354,16 +359,18 @@ class PositionReconciler:
                         )
                     )
                 elif loc and not rem:
-                    self.discrepancies.append(
-                        ReconciliationDiscrepancy(
-                            category="missing_position",
-                            symbol=sym,
-                            local_value=loc.get("quantity"),
-                            exchange_value=0.0,
-                            severity="critical",
-                            message=f"Local position {sym} missing from Binance exchange",
+                    # In Spot mode, holding wallet assets is normal; only flag missing futures contract positions
+                    if self.connector.market_type == "futures":
+                        self.discrepancies.append(
+                            ReconciliationDiscrepancy(
+                                category="missing_position",
+                                symbol=sym,
+                                local_value=loc.get("quantity"),
+                                exchange_value=0.0,
+                                severity="critical",
+                                message=f"Local position {sym} missing from Binance exchange",
+                            )
                         )
-                    )
                 elif rem and loc:
                     rem_qty = abs(rem["position_amt"])
                     loc_qty = float(loc.get("quantity", 0.0))

@@ -29,6 +29,16 @@ from .paper import PaperBroker
 
 logger = get_logger("trading")
 
+# Internal paper exit short-codes -> canonical labels used by the broker
+# notification layer. When a directional exit is flagged on the broker via
+# ``_last_exit_reason``, downstream notifiers (e.g. ``_notify_fill``) emit the
+# human-readable label so trade-lifecycle DMs say TAKE_PROFIT / STOP_LOSS.
+_PAPER_EXIT_REASON_LABELS = {
+    "tp": "TAKE_PROFIT",
+    "sl": "STOP_LOSS",
+    "liquidation": "LIQUIDATION",
+}
+
 
 @dataclass
 class PaperTradingConfig:
@@ -333,6 +343,9 @@ class PaperTradingEngine:
 
     def _do_exit(self, pos: Dict[str, Any], fill: float, reason: str, bar_time: int) -> None:
         """Place a paper exit at ``fill`` and stamp the resulting closed trade."""
+        # Thread exit reason into the broker/session so any downstream
+        # notification code (broker-level reconciliation) can tag
+        # directional exits precisely.
         self.broker.price_source.set_price(fill)  # type: ignore[attr-defined]
         order = Order(
             order_id=f"paper_exit_{len(self.broker.orders)}",
@@ -345,6 +358,15 @@ class PaperTradingEngine:
             t = self.broker.closed_trades[-1]
             t["exit_reason"] = reason
             t["exit_time"] = int(bar_time)
+            # Expose to broker notify layer (best-effort): some brokers
+            # may read the last closed trade to tag notifications. Map the
+            # internal short-code to a canonical label so notifiers emit
+            # TAKE_PROFIT / STOP_LOSS rather than tp / sl.
+            try:
+                label = _PAPER_EXIT_REASON_LABELS.get(reason, reason)
+                setattr(self.broker, "_last_exit_reason", label)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ risk feedback
     def _feed_risk_from_closed(self, now_ms: int) -> None:

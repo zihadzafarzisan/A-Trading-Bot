@@ -16,11 +16,12 @@ logger = get_logger("research")
 
 # Supported ranking objectives
 OBJECTIVES = (
+    "multi_objective",
+    "best_overall",
     "max_win_rate",
     "max_profit_factor",
     "max_risk_adjusted_return",
     "min_drawdown",
-    "best_overall",
 )
 
 
@@ -166,6 +167,10 @@ class RankingEngine:
     # ------------------------------------------------------------ scoring
     def _score(self, metrics: Dict[str, Any]) -> float:
         """Score a candidate's metrics for the configured objective."""
+        if self.objective == "multi_objective":
+            from ..validation.optimize_window import score_metrics_multi_objective
+            score, _, _, _ = score_metrics_multi_objective(metrics)
+            return score
         if self.objective == "max_win_rate":
             return float(metrics.get("win_rate", 0.0))
         if self.objective == "max_profit_factor":

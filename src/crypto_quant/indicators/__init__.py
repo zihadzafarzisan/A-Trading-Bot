@@ -12,6 +12,7 @@ from .trend import (
     ema,
     ema_crossover,
     adx,
+    dmi,
     trend_slope,
     macd_line,
 )
@@ -32,6 +33,7 @@ from .volatility import (
     donchian_channel,
     keltner_channel,
     atr_percentile,
+    choppiness_index,
 )
 from .volume import (
     volume_sma,
@@ -50,6 +52,7 @@ INDICATOR_REGISTRY = {
     "ema": ema,
     "ema_crossover": ema_crossover,
     "adx": adx,
+    "dmi": dmi,
     "trend_slope": trend_slope,
     "macd_line": macd_line,
     # momentum
@@ -68,6 +71,7 @@ INDICATOR_REGISTRY = {
     "donchian_channel": donchian_channel,
     "keltner_channel": keltner_channel,
     "atr_percentile": atr_percentile,
+    "choppiness_index": choppiness_index,
     # volume
     "volume_sma": volume_sma,
     "volume_ratio": volume_ratio,
@@ -78,10 +82,10 @@ INDICATOR_REGISTRY = {
 }
 
 __all__ = [
-    "sma", "ema", "ema_crossover", "adx", "trend_slope", "macd_line",
+    "sma", "ema", "ema_crossover", "adx", "dmi", "trend_slope", "macd_line",
     "rsi", "macd", "stochastic", "roc", "momentum", "williams_r", "cci",
     "atr", "bollinger_bands", "historical_volatility", "volatility_percentile",
-    "donchian_channel", "keltner_channel", "atr_percentile",
+    "donchian_channel", "keltner_channel", "atr_percentile", "choppiness_index",
     "volume_sma", "volume_ratio", "obv", "volume_momentum", "mfi", "vwap",
     "INDICATOR_REGISTRY",
 ]

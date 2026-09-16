@@ -12,6 +12,7 @@ from sqlalchemy import (
     Text,
     Boolean,
     ForeignKey,
+    CheckConstraint,
     Index,
     UniqueConstraint,
 )
@@ -391,6 +392,56 @@ class LiveOrder(Base):
         Index("ix_live_orders_symbol", "symbol"),
         Index("ix_live_orders_status", "status"),
         Index("ix_live_orders_created", "created_at"),
+    )
+
+
+class CarryPositionRecord(Base):
+    """Durable lifecycle ledger for one delta-neutral cash-and-carry position."""
+    __tablename__ = "carry_positions"
+
+    position_id = Column(String(64), primary_key=True)
+    symbol = Column(String(20), nullable=False)
+    quantity = Column(Float, nullable=False)
+    spot_fill_price = Column(Float, nullable=False)
+    futures_fill_price = Column(Float, nullable=False)
+    entry_basis_spread_pct = Column(Float, nullable=False)
+    leg_gap_ms = Column(Float, nullable=True)  # unhedged window between the two entry fills (ms)
+    baseline_spot_qty = Column(Float, nullable=True)      # pre-existing spot inventory at entry
+    baseline_futures_qty = Column(Float, nullable=True)   # pre-existing futures position at entry
+    status = Column(String(20), nullable=False)
+    opened_at = Column(DateTime, nullable=False)
+    closed_at = Column(DateTime)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('OPEN', 'UNWINDING', 'CLOSED', 'ORPHAN_UNWOUND', 'DESYNC_CLOSED')",
+            name="ck_carry_position_status",
+        ),
+        Index("ix_carry_positions_symbol_status", "symbol", "status"),
+        Index("ix_carry_positions_opened_at", "opened_at"),
+    )
+
+
+class CarryFundingPaymentRecord(Base):
+    """One observed funding settlement attributable to a carry position."""
+    __tablename__ = "carry_funding_payments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    position_id = Column(String(64), ForeignKey("carry_positions.position_id"), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    funding_rate = Column(Float, nullable=False)
+    funding_payment_usdt = Column(Float, nullable=False)
+    mark_price = Column(Float, nullable=False)
+    timestamp = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+
+    position = relationship("CarryPositionRecord", backref="funding_payments")
+
+    __table_args__ = (
+        UniqueConstraint("position_id", "timestamp", name="uq_carry_funding_settlement"),
+        Index("ix_carry_funding_symbol_timestamp", "symbol", "timestamp"),
     )
 
 

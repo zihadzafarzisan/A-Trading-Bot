@@ -57,7 +57,12 @@ class LogManager:
             file_path = self.config["file_handlers"][name]
             Path(file_path).parent.mkdir(parents=True, exist_ok=True)
 
-            file_handler = logging.FileHandler(file_path)
+            # utf-8 + backslashreplace so non-ASCII text (and any stray
+            # unicode that slips into a message) round-trips to the log file
+            # without raising UnicodeEncodeError on a cp1252 Windows console.
+            file_handler = logging.FileHandler(
+                file_path, encoding="utf-8", errors="backslashreplace"
+            )
             file_handler.setLevel(getattr(logging, level or self.config["level"]))
             formatter = logging.Formatter(self.config["format"])
             file_handler.setFormatter(formatter)

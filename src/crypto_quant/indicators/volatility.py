@@ -176,3 +176,38 @@ def atr_percentile(
     if shift:
         result = result.shift(shift)
     return result
+
+
+def choppiness_index(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+    shift: int = 1,
+) -> pd.Series:
+    """Choppiness Index in [0, 100].
+
+    Values > 61.8 indicate consolidation / choppy market.
+    Values < 38.2 indicate strong directional trend.
+    """
+    if period <= 1:
+        raise ValueError("period must be > 1")
+
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    tr_sum = tr.rolling(period, min_periods=period).sum()
+    highest_high = high.rolling(period, min_periods=period).max()
+    lowest_low = low.rolling(period, min_periods=period).min()
+    price_range = (highest_high - lowest_low).replace(0, np.nan)
+
+    ratio = tr_sum / price_range
+    chop = 100.0 * np.log10(ratio.replace(0, np.nan)) / np.log10(period)
+    chop = chop.replace([np.inf, -np.inf], np.nan).fillna(50.0)
+
+    if shift:
+        chop = chop.shift(shift)
+    return chop

@@ -116,11 +116,20 @@ class BacktestEngine:
         n = len(prepared)
 
         for i in range(n):
+            # 0) Per-bar dynamic stop management (Strategy #8 hook).
+            #    Called AFTER close of bar i; effective one bar delayed.
+            for pos in list(portfolio.open_positions):
+                try:
+                    strategy.update_stop(prepared, i, pos)
+                except Exception as exc:
+                    logger.error("Stop management failed at bar %d: %s. Aborting backtest.", i, exc)
+                    raise RuntimeError(f"Dynamic risk failure at bar {i}") from exc
+
             # 1) Fill pending entries at this bar's open
             if pending:
                 for sig in list(pending):
                     if portfolio.can_open(self.config.max_open_positions):
-                        self._try_enter(portfolio, sig, opens[i], times[i], i, symbol)
+                        self._try_enter(portfolio, sig, opens[i], times[i], i, symbol, strategy, prepared)
                     pending.remove(sig)
 
             # 2) Manage open positions with this bar's high/low
@@ -138,7 +147,8 @@ class BacktestEngine:
                 except Exception as exc:
                     logger.debug("Signal error at bar %d: %s", i, exc)
                     sig = Signal(direction=Direction.NONE)
-                pending = [sig]
+                if sig.is_active:
+                    pending = [sig]
 
         # Close any still-open positions at the last close (end of test)
         last_price = closes[-1]
@@ -187,6 +197,8 @@ class BacktestEngine:
         bar_time: int,
         bar_index: int,
         symbol: str,
+        strategy: BaseStrategy,
+        df: pd.DataFrame,
     ) -> None:
         """Size and open a position from a signal."""
         direction = sig.direction
@@ -201,7 +213,16 @@ class BacktestEngine:
         raw_fill = float(bar_open)
         entry_price = self.execution.entry_fill(raw_fill, direction.value, raw_fill)
         entry_slippage = abs(entry_price - raw_fill)
-        if sig.stop_loss is None:
+
+        # Retrieve the original signal bar index (default to bar_index-1 if missing)
+        signal_bar_index = sig.meta.get("signal_bar", max(0, bar_index - 1))
+
+        # Re-anchor stop/take profit via the strategy given the actual fill price
+        stop_price, take_profit, extra_state = strategy.prepare_fill(
+            df, signal_bar_index, direction, entry_price, sig
+        )
+
+        if stop_price is None:
             return  # cannot risk-size without a stop
 
         leverage = self._resolve_leverage(direction)
@@ -209,7 +230,7 @@ class BacktestEngine:
             sizing = self.sizer.size_position(
                 equity=portfolio.equity,
                 entry_price=entry_price,
-                stop_price=sig.stop_loss,
+                stop_price=stop_price,
                 direction=direction.value,
                 market_type=self.config.market_type,
                 leverage=leverage,
@@ -235,13 +256,16 @@ class BacktestEngine:
                 entry_price=entry_price,
                 entry_time=bar_time,
                 entry_bar=bar_index,
-                stop_loss=sig.stop_loss,
-                take_profit=sig.take_profit,
+                stop_loss=stop_price,
+                take_profit=take_profit,
                 leverage=sizing.leverage,
                 market_type=self.config.market_type,
                 fee=fee,
             )
             pos.slippage = entry_slippage
+            pos.initial_stop = float(stop_price)
+            pos.active_stop = pos.initial_stop
+            pos.extra_state = extra_state
         except ValueError:
             logger.debug("Entry rejected by portfolio accounting")
 
@@ -280,19 +304,23 @@ class BacktestEngine:
                     self._close(portfolio, pos, fill, bar_time, bar_index, "liquidation")
                     continue
 
-            # Stop loss
-            hit_sl = (direction == "long" and low <= pos.stop_loss) or \
-                     (direction == "short" and high >= pos.stop_loss)
-            # Take profit
-            hit_tp = (direction == "long" and high >= pos.take_profit) or \
-                     (direction == "short" and low <= pos.take_profit)
+            # Stop loss (uses dynamic active_stop if set)
+            hit_sl = (direction == "long" and low <= pos.effective_stop) or \
+                     (direction == "short" and high >= pos.effective_stop)
+            # Take profit (None take_profit -> no TP level; uncapped right tail, Strategy #9 V1.1)
+            hit_tp = pos.take_profit is not None and (
+                (direction == "long" and high >= pos.take_profit) or
+                (direction == "short" and low <= pos.take_profit)
+            )
 
+            # Use active_stop for exit fill (dynamic position management)
+            stop_exit = pos.effective_stop if pos.active_stop is not None else pos.stop_loss
             if hit_sl and hit_tp:
                 # Conservative: stop assumed first
-                self._close(portfolio, pos, pos.stop_loss, bar_time, bar_index, "sl")
+                self._close(portfolio, pos, stop_exit, bar_time, bar_index, "sl")
             elif hit_sl:
                 # Gap handling: fill at the worse of open vs stop
-                fill = min(open_price, pos.stop_loss) if direction == "long" else max(open_price, pos.stop_loss)
+                fill = min(open_price, stop_exit) if direction == "long" else max(open_price, stop_exit)
                 self._close(portfolio, pos, fill, bar_time, bar_index, "sl")
             elif hit_tp and self.config.honor_take_profit:
                 fill = max(open_price, pos.take_profit) if direction == "long" else min(open_price, pos.take_profit)

@@ -10,6 +10,51 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pytest
 import tempfile
 
+# ---------------------------------------------------------------------------
+# Discord test isolation
+# ---------------------------------------------------------------------------
+# By default, force hermetic execution: never allow tests to hit Discord's
+# network. Individual Discord unit tests already monkeypatch
+# `crypto_quant.notifications.discord_dm.requests.request`; this fixture only
+# provides a safe fallback when a test doesn't explicitly override.
+
+
+@pytest.fixture(autouse=True)
+def _isolate_discord_http(monkeypatch):
+    """Autouse: patch Discord REST calls to a no-op for all tests."""
+    try:
+        import crypto_quant.notifications.discord_dm as dm
+    except Exception:
+        # If the module can't import, don't block unrelated test suites.
+        yield
+        return
+
+    def _no_network_request(method, url, headers=None, json=None, timeout=None):
+        raise RuntimeError(
+            f"Discord HTTP unexpectedly attempted during tests: {method} {url}"
+        )
+
+    monkeypatch.setattr(
+        "crypto_quant.notifications.discord_dm.requests.request",
+        _no_network_request,
+    )
+    yield
+
+    # Unpatch is handled by pytest's monkeypatch fixture teardown.
+
+
+import crypto_quant.notifications.discord_dm as _dm  # noqa: E402
+
+# Keep lint quiet; fixture exists for its side effects.
+assert _dm is not None
+
+import pytest as _pytest  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# End Discord test isolation
+# ---------------------------------------------------------------------------
+
+
 from crypto_quant.config.settings import AppConfig
 from crypto_quant.db.connection import DatabaseManager, init_database
 

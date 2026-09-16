@@ -1,8 +1,21 @@
 """Main CLI application for Crypto Quant Terminal."""
 
+# Entry-point self-hydration: hydrate the root .env BEFORE any crypto_quant.*
+# submodule below is imported. discord_dm.py / live_broker.py read
+# DISCORD_BOT_TOKEN / DISCORD_USER_ID at notifier-construction time; without
+# this the daemon booted with a bare environment and silently disabled Discord
+# notifications. Zero-touch: no manual exports, --token flags, or auxiliary
+# scripts needed to launch the harvester.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import json
+import os
 import sys
-from typing import Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 from pathlib import Path
 
 # Ensure UTF-8 output on Windows consoles (Rich / unicode glyphs)
@@ -46,8 +59,13 @@ app = typer.Typer(
     help="Crypto Quant Research Terminal - Quantitative Research & Trading System",
     add_completion=False,
 )
+carry_app = typer.Typer(help="Cash-and-carry funding harvester controls.", add_completion=False)
+app.add_typer(carry_app, name="carry")
+notify_app = typer.Typer(help="Discord DM notification controls.", add_completion=False)
+app.add_typer(notify_app, name="notify")
 
 console = Console()
+logger = get_logger("trading")
 
 
 def show_header():
@@ -743,7 +761,7 @@ def ml(
 
 @app.command()
 def dashboard(
-    action: str = typer.Argument(..., help="Action: generate, open"),
+    action: str = typer.Argument(..., help="Action: generate, carry"),
     symbol: str = typer.Option("BTCUSDT", "--symbol", help="Symbol"),
     timeframe: str = typer.Option("1h", "--timeframe", "-t", help="Timeframe"),
     strategy: str = typer.Option("trend", "--strategy", "-s", help="Strategy type"),
@@ -751,6 +769,7 @@ def dashboard(
     experiment_id: Optional[str] = typer.Option(None, "--experiment", "-e", help="Experiment ID (from research run)"),
     output: str = typer.Option("dashboard/report.html", "--output", "-o", help="Output HTML path"),
     open_in_browser: bool = typer.Option(False, "--open", help="Open in browser after generating"),
+    carry: bool = typer.Option(False, "--carry", "-c", help="Generate Cash-and-Carry strategy dashboard"),
 ):
     """Generate the local HTML dashboard."""
     console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
@@ -762,8 +781,21 @@ def dashboard(
     repo = MarketDataRepository(db)
     config = get_config()
 
+    if carry:
+        data = DashboardGenerator.from_carry(db)
+        path = DashboardGenerator().generate(data, output)
+        console.print(f"[green]✓[/green] Cash-and-Carry Dashboard written to {path}")
+        if open_in_browser or action == "open":
+            import webbrowser
+            webbrowser.open(Path(path).resolve().as_uri())
+        return
+
+    if action == "carry":
+        data = DashboardGenerator.from_carry(db)
+        path = DashboardGenerator().generate(data, output)
+        console.print(f"[green]✓[/green] Cash-and-carry dashboard written to {path}")
     # If an experiment ID is given, render its ranked strategies
-    if experiment_id:
+    elif experiment_id:
         from ..research import ExperimentTracker
         tracker = ExperimentTracker(db)
         exp = tracker.get_experiment(experiment_id)
@@ -1025,6 +1057,79 @@ def paper_start(strategy, symbol, timeframe, market, start, end, config,
                       f"[bold]Market:[/bold] {market} | [bold]Poll:[/bold] {poll_s}s")
         console.print("[dim]Run `paper stop` from another shell or press Ctrl+C to stop.[/dim]")
         worker.run_loop()
+
+
+@app.command("research")
+def research_cmd(
+    strategy: str = typer.Option("all", "--strategy", "-s", help="Strategy: mtf_trend_pullback, breakout_retest, trend_filtered_rsi, regime_adaptive, vwap_bollinger_mr, or all"),
+    symbol: str = typer.Option("BTCUSDT", "--symbol", help="Symbol: BTCUSDT, ETHUSDT, or all"),
+    timeframe: str = typer.Option("1h", "--timeframe", "-t", help="Timeframe: 5m, 15m, 1h, 4h, 1d, or all"),
+    market: str = typer.Option("futures", "--market", "-m", help="Market type: futures or spot"),
+    matrix: bool = typer.Option(False, "--matrix", help="Run full 2x5x5 research matrix"),
+    output: Optional[str] = typer.Option("data/multi_strategy_research_report.json", "--output", "-o", help="Report output JSON path"),
+):
+    """Run systematic strategy research and multi-objective ranking."""
+    from ..research.multi_strategy_engine import MultiStrategyResearchEngine, STRATEGY_FAMILIES, SYMBOLS, TIMEFRAMES
+
+    engine = MultiStrategyResearchEngine(market_type=market)
+
+    target_syms = SYMBOLS if (symbol.lower() == "all" or matrix) else [symbol]
+    target_tfs = TIMEFRAMES if (timeframe.lower() == "all" or matrix) else [timeframe]
+    target_strats = STRATEGY_FAMILIES if (strategy.lower() == "all" or matrix) else [strategy]
+
+    console.print(f"[bold cyan]Running Quantitative Strategy Research[/bold cyan]")
+    console.print(f"Symbols: {target_syms} | Timeframes: {target_tfs} | Strategies: {target_strats} | Market: {market}\n")
+
+    results = engine.run_matrix(
+        symbols=target_syms,
+        timeframes=target_tfs,
+        strategies=target_strats,
+        market_type=market,
+    )
+
+    # Print summary table
+    table = Table(title="Strategy Research Ranking Matrix", show_header=True, header_style="bold magenta")
+    table.add_column("Rank", style="cyan", width=5)
+    table.add_column("Strategy", style="white", width=20)
+    table.add_column("Symbol", style="yellow", width=8)
+    table.add_column("TF", style="green", width=5)
+    table.add_column("Trades", justify="right", width=7)
+    table.add_column("Win Rate", justify="right", width=9)
+    table.add_column("PF", justify="right", width=6)
+    table.add_column("Expectancy", justify="right", width=10)
+    table.add_column("Net Ret", justify="right", width=8)
+    table.add_column("MaxDD", justify="right", width=7)
+    table.add_column("Sharpe", justify="right", width=7)
+    table.add_column("Score", justify="right", width=7)
+    table.add_column("Status", width=8)
+
+    for i, r in enumerate(results):
+        m = r.metrics
+        status = "[green]PASS[/green]" if r.passed_filters else "[red]REJECT[/red]"
+        table.add_row(
+            str(i + 1),
+            r.strategy,
+            r.symbol,
+            r.timeframe,
+            str(m.get("total_trades", 0)),
+            f"{m.get('win_rate', 0)*100:.1f}%",
+            f"{m.get('profit_factor', 0):.2f}",
+            f"${m.get('expectancy', 0):.2f}",
+            f"{m.get('net_return', 0)*100:.1f}%",
+            f"{m.get('max_drawdown', 0)*100:.1f}%",
+            f"{m.get('sharpe_ratio', 0):.2f}",
+            f"{r.score:.4f}",
+            status,
+        )
+
+    console.print(table)
+
+    if output:
+        out_data = [r.to_dict(include_trades=False) for r in results]
+        with open(output, "w") as f:
+            json.dump(out_data, f, indent=2)
+        console.print(f"\n[bold green]✓[/bold green] Research report saved to {output}")
+
 
 
 def _print_paper_result(result, strat_type: str) -> None:
@@ -1427,6 +1532,11 @@ def live(
 ):
     """Production live trading execution commands (Binance Spot & Futures)."""
     import os
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     from ..exchange.binance_live import BinanceLiveConnector
     from ..execution.live_broker import BinanceLiveBroker
     from ..execution.live_worker import LiveExecutionWorker, LiveWorkerConfig
@@ -1590,11 +1700,35 @@ def live(
                 console.print(f"  [red]•[/red] [{d.category}] {d.message}")
 
     elif action == "positions":
-        positions = broker.get_positions()
+        # Check database for bot's active trading session positions
+        from ..db.models import LiveAccount
+        s = db.get_session()
+        positions = []
+        acct_symbol = symbol
+        try:
+            acct = s.query(LiveAccount).filter(LiveAccount.status == "running").order_by(LiveAccount.updated_at.desc()).first()
+            if not acct:
+                acct = s.query(LiveAccount).order_by(LiveAccount.updated_at.desc()).first()
+            if acct:
+                acct_symbol = acct.symbol
+                if acct.positions:
+                    try:
+                        all_pos = json.loads(acct.positions)
+                        # Filter to the bot's target trading symbol (e.g. BTCUSDT)
+                        positions = [p for p in all_pos if p.get("symbol") == acct.symbol]
+                        if not positions and all_pos:
+                            # If no target symbol position is open, let user know
+                            positions = []
+                    except Exception:
+                        positions = []
+        finally:
+            s.close()
+
         if not positions:
-            console.print("[yellow]No open positions found.[/yellow]")
+            console.print(f"[yellow]No active strategy position open for {acct_symbol}.[/yellow]")
+            console.print("[dim]The bot is waiting for a valid strategy entry signal (trend / breakout / momentum) to enter a trade.[/dim]")
         else:
-            pos_table = Table(title="Open Positions", show_header=True)
+            pos_table = Table(title=f"Open Strategy Position ({acct_symbol})", show_header=True)
             pos_table.add_column("Symbol", style="cyan")
             pos_table.add_column("Side", style="white")
             pos_table.add_column("Quantity", justify="right")
@@ -1602,38 +1736,593 @@ def live(
             pos_table.add_column("Notional", justify="right")
             pos_table.add_column("Leverage", justify="right")
             for p in positions:
+                notional = float(p.get("notional", 0.0)) or (float(p.get("quantity", 0.0)) * float(p.get("entry_price", 0.0)))
                 pos_table.add_row(
                     p.get("symbol", "-"), p.get("side", "-"),
                     f"{float(p.get('quantity', 0)):.4f}",
                     f"${float(p.get('entry_price', 0)):.4f}",
-                    f"${float(p.get('notional', 0)):.2f}",
+                    f"${notional:.2f}",
                     f"{p.get('leverage', 1)}x",
                 )
             console.print(pos_table)
 
     elif action == "orders":
-        orders = broker.orders
+        from ..db.models import LiveOrder
+        s = db.get_session()
+        try:
+            orders = s.query(LiveOrder).order_by(LiveOrder.created_at.desc()).limit(20).all()
+        finally:
+            s.close()
+
         if not orders:
-            console.print("[yellow]No orders in current session.[/yellow]")
+            console.print("[yellow]No orders recorded yet in database.[/yellow]")
         else:
-            o_table = Table(title="Session Orders", show_header=True)
+            o_table = Table(title="Live Trading Orders (Database)", show_header=True)
             o_table.add_column("ID", style="cyan")
             o_table.add_column("Symbol", style="magenta")
             o_table.add_column("Side", style="white")
             o_table.add_column("Qty", justify="right")
             o_table.add_column("Status", style="yellow")
             o_table.add_column("Fill Price", justify="right")
-            o_table.add_column("Message")
+            o_table.add_column("Created At")
             for o in orders:
                 o_table.add_row(
-                    o.order_id, o.symbol, o.side,
-                    f"{o.quantity:.4f}", o.status,
-                    f"${o.fill_price:.4f}" if o.fill_price else "-",
-                    o.message[:40] if o.message else "-",
+                    o.id[:18], o.symbol, o.side.upper(),
+                    f"{o.requested_qty:.4f}",
+                    f"[green]{o.status}[/green]" if o.status == "filled" else o.status,
+                    f"${o.avg_fill_price:.4f}" if o.avg_fill_price else "-",
+                    o.created_at.strftime("%Y-%m-%d %H:%M:%S") if o.created_at else "-",
                 )
             console.print(o_table)
     else:
         console.print(f"[bold red]Unknown live action:[/bold red] {action}. Expected: start, stop, status, kill, reconcile, orders, positions")
+
+
+# ---------------------------------------------------------------------------
+# Discord DM notifications
+# ---------------------------------------------------------------------------
+@notify_app.command("test-dm")
+def notify_test_dm(
+    token: Optional[str] = typer.Option(None, "--token", help="Discord Bot Token (overrides DISCORD_BOT_TOKEN env var)"),
+    user_id: Optional[str] = typer.Option(None, "--user-id", help="Discord User Id (overrides DISCORD_USER_ID env var)"),
+):
+    """Send a test Discord DM to verify the notification pipeline."""
+    from ..notifications.discord_dm import DiscordDMNotifier
+
+    # Load .env if present (same convention used in `live` command).
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+    notifier = DiscordDMNotifier(token=token, user_id=user_id)
+    if not notifier._enabled:
+        console.print("[bold yellow]Discord notifier is disabled — DISCORD_BOT_TOKEN and DISCORD_USER_ID must be set (via --token/--user-id or env vars).[/bold yellow]")
+        raise typer.Abort()
+
+    # Build a test embed (GREEN) with system info
+    import platform
+    payload = {
+        "title": "🟢 Discord DM Pipeline Test",
+        "color": DiscordDMNotifier.COLOR_GREEN,
+        "fields": [
+            {"name": "System", "value": f"{platform.system()} {platform.release()}", "inline": True},
+            {"name": "Python", "value": platform.python_version(), "inline": True},
+            {"name": "Hostname", "value": platform.node() or "unknown", "inline": True},
+            {"name": "Status", "value": "✅ Notification pipeline is operational", "inline": False},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    # Fire synchronously (blocking is OK in a one-off CLI test)
+    try:
+        channel_id = notifier._ensure_dm_channel()
+        notifier._request("POST", f"https://discord.com/api/v10/channels/{channel_id}/messages", json={"embeds": [payload]})
+        console.print("[bold green]✓ Discord DM test embed sent successfully.[/bold green]")
+        console.print(f"  DM channel: {channel_id}")
+    except Exception as exc:
+        console.print(f"[bold red]✗ Discord DM test failed: {exc}[/bold red]")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Cash-and-carry terminal operations
+# ---------------------------------------------------------------------------
+def _carry_build_broker(dry_run: bool, testnet: bool = True):
+    """Build the production twin-leg broker from environment credentials."""
+    from dotenv import load_dotenv
+    from ..exchange.binance_live import BinanceLiveConnector
+    from ..execution.live_broker import BinanceLiveBroker, TwinLegCarryBroker
+
+    load_dotenv(override=True)
+    spot = BinanceLiveConnector(
+        api_key=os.getenv("BINANCE_SPOT_TESTNET_KEY", ""),
+        api_secret=os.getenv("BINANCE_SPOT_TESTNET_SECRET", ""),
+        market_type="spot",
+        testnet=testnet,
+        recv_window=60000,
+    )
+    futures = BinanceLiveConnector(
+        api_key=os.getenv("BINANCE_FUTURES_TESTNET_KEY", ""),
+        api_secret=os.getenv("BINANCE_FUTURES_TESTNET_SECRET", ""),
+        market_type="futures",
+        testnet=testnet,
+        recv_window=60000,
+    )
+    return TwinLegCarryBroker(
+        BinanceLiveBroker(spot, dry_run=dry_run),
+        BinanceLiveBroker(futures, dry_run=dry_run),
+    )
+
+
+def _carry_position_from_record(record):
+    """Reconstruct the minimum broker position object for a manual unwind."""
+    from ..execution.live_broker import TwinLegPosition
+
+    opened = record.opened_at.replace(tzinfo=timezone.utc).timestamp()
+    closed = record.closed_at.replace(tzinfo=timezone.utc).timestamp() if record.closed_at else None
+    base = record.symbol[:-4] if record.symbol.endswith("USDT") else record.symbol
+    return TwinLegPosition(
+        position_id=record.position_id,
+        base_asset=base,
+        quote_asset="USDT",
+        quantity=float(record.quantity),
+        spot_order_id="",
+        spot_fill_price=float(record.spot_fill_price),
+        futures_order_id="",
+        futures_fill_price=float(record.futures_fill_price),
+        entry_basis_spread_pct=float(record.entry_basis_spread_pct),
+        execution_gap_ms=float(record.leg_gap_ms or 0.0),
+        status=record.status,
+        opened_at=opened,
+        closed_at=closed,
+    )
+
+
+def _carry_duration_str(seconds: float) -> str:
+    """Render a duration in seconds as a compact human string."""
+    hours = max(0.0, seconds / 3600.0)
+    if hours < 1.0:
+        return f"{hours * 60:.0f}m"
+    if hours < 24.0:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def _carry_live_metrics(record, funding_total: float) -> Dict[str, Any]:
+    """Fetch current carry metrics; callers render unavailability safely."""
+    broker = _carry_build_broker(dry_run=True)
+    symbol = record.symbol
+    mark = broker.futures.connector.get_mark_price(symbol)
+    spot = broker.spot.connector.get_ticker_price(symbol)
+    account = broker.futures.connector.get_account_info()
+    margin_balance = float(account.get("totalMarginBalance", account.get("totalWalletBalance", 0.0)) or 0.0)
+    maintenance = float(account.get("totalMaintMargin", 0.0) or 0.0)
+    buffer_pct = ((margin_balance - maintenance) / margin_balance * 100) if margin_balance > 0 else None
+    qty = float(record.quantity)
+    spot_pnl = (spot - float(record.spot_fill_price)) * qty
+    futures_pnl = (float(record.futures_fill_price) - mark) * qty
+    return {
+        "mark": mark,
+        "spot": spot,
+        "basis_pct": ((mark - spot) / spot * 100) if spot else None,
+        "margin_balance": margin_balance,
+        "margin_buffer_pct": buffer_pct,
+        "funding": funding_total,
+        "net_pnl": spot_pnl + futures_pnl + funding_total,
+    }
+
+
+def _carry_funding_rate_map(broker, symbol: str, start_time: int, end_time: int) -> Dict[int, float]:
+    """Map settlement-time (ms) -> settled funding rate for a symbol's window."""
+    rate_by_time: Dict[int, float] = {}
+    try:
+        history = broker.futures.connector.get_funding_rate_history(
+            symbol, start_time=start_time, limit=1000
+        )
+        for item in history:
+            ft = int(item.get("fundingTime", item.get("time", 0)) or 0)
+            rate_by_time[ft] = float(item.get("fundingRate", 0.0) or 0.0)
+    except Exception as exc:
+        logger.warning("Funding rate history fetch failed for %s: %s", symbol, exc)
+    return rate_by_time
+
+
+def _carry_mark_price(broker, symbol: str) -> float:
+    """Current futures mark price; 0.0 fallback when unavailable."""
+    try:
+        return float(broker.futures.connector.get_mark_price(symbol))
+    except Exception:
+        return 0.0
+
+
+@carry_app.command("status")
+def carry_status():
+    """Show persisted carry positions and live metrics for currently open carries."""
+    from ..db.models import CarryFundingPaymentRecord, CarryPositionRecord
+
+    db = get_db_manager()
+    db.create_tables()
+    session = db.get_session()
+    try:
+        positions = session.query(CarryPositionRecord).order_by(CarryPositionRecord.opened_at.desc()).all()
+        funding_by_position = {
+            position_id: float(total or 0.0)
+            for position_id, total in session.query(
+                CarryFundingPaymentRecord.position_id,
+                __import__("sqlalchemy").func.sum(CarryFundingPaymentRecord.funding_payment_usdt),
+            ).group_by(CarryFundingPaymentRecord.position_id).all()
+        }
+    finally:
+        session.close()
+
+    if not positions:
+        console.print("[yellow]No carry positions recorded yet.[/yellow]")
+        return
+
+    now = datetime.now(timezone.utc)
+    table = Table(title="Cash-and-Carry Position Ledger", show_header=True, header_style="bold cyan")
+    for column in ("Position ID", "Symbol", "Qty", "Spot Price", "Futures Price", "Basis Spread %", "Leg Gap (ms)", "Status", "Duration (Hours)"):
+        table.add_column(column)
+    for row in positions:
+        opened = row.opened_at.replace(tzinfo=timezone.utc)
+        end = row.closed_at.replace(tzinfo=timezone.utc) if row.closed_at else now
+        duration = max(0.0, (end - opened).total_seconds() / 3600)
+        table.add_row(
+            row.position_id, row.symbol, f"{row.quantity:.8f}", f"${row.spot_fill_price:.4f}",
+            f"${row.futures_fill_price:.4f}", f"{row.entry_basis_spread_pct:+.4f}%",
+            f"{row.leg_gap_ms:.1f}" if row.leg_gap_ms is not None else "-",
+            row.status, f"{duration:.2f}",
+        )
+    console.print(table)
+
+    for row in positions:
+        if row.status != "OPEN":
+            continue
+        funding = funding_by_position.get(row.position_id, 0.0)
+        try:
+            metrics = _carry_live_metrics(row, funding)
+            live = Table(title=f"Live Carry Health: {row.position_id}", show_header=True)
+            for name in ("Mark Price", "Spot Price", "Current Basis", "Margin Balance", "Safety Buffer", "Confirmed Funding", "Net Unrealized PnL"):
+                live.add_column(name)
+            live.add_row(
+                f"${metrics['mark']:.4f}", f"${metrics['spot']:.4f}",
+                f"{metrics['basis_pct']:+.4f}%" if metrics["basis_pct"] is not None else "N/A",
+                f"${metrics['margin_balance']:.2f}",
+                f"{metrics['margin_buffer_pct']:.2f}%" if metrics["margin_buffer_pct"] is not None else "N/A",
+                f"${metrics['funding']:+.6f}", f"${metrics['net_pnl']:+.6f}",
+            )
+            console.print(live)
+        except Exception as exc:
+            logger.warning("Carry live metrics unavailable for %s: %s", row.position_id, exc)
+            console.print(f"[yellow]Live metrics unavailable for {row.position_id}: {exc}[/yellow]")
+
+
+@carry_app.command("payments")
+def carry_payments(limit: int = typer.Option(20, "--limit", min=1, max=500, help="Maximum ledger rows to display")):
+    """Show settled funding credits/debits and cumulative realized funding."""
+    from sqlalchemy import func
+    from ..db.models import CarryFundingPaymentRecord
+
+    db = get_db_manager()
+    db.create_tables()
+    session = db.get_session()
+    try:
+        rows = session.query(CarryFundingPaymentRecord).order_by(CarryFundingPaymentRecord.timestamp.desc()).limit(limit).all()
+        cumulative = float(session.query(func.coalesce(func.sum(CarryFundingPaymentRecord.funding_payment_usdt), 0.0)).scalar() or 0.0)
+    finally:
+        session.close()
+    if not rows:
+        console.print("[yellow]No confirmed carry funding payments recorded yet.[/yellow]")
+        return
+    table = Table(title="Carry Funding Payment Ledger", show_header=True, header_style="bold cyan")
+    for column in ("Timestamp (UTC)", "Position ID", "Symbol", "Funding Rate %", "Mark Price", "Payment (USDT)"):
+        table.add_column(column)
+    for row in rows:
+        timestamp = row.timestamp.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        table.add_row(timestamp, row.position_id, row.symbol, f"{row.funding_rate * 100:+.6f}%", f"${row.mark_price:.4f}", f"${row.funding_payment_usdt:+.6f}")
+    console.print(table)
+    console.print(f"[bold green]Cumulative confirmed funding income: ${cumulative:+.6f}[/bold green]")
+
+
+@carry_app.command("unwind")
+def carry_unwind(position_id: str = typer.Argument(..., help="Persisted carry position id"), dry: bool = typer.Option(False, "--dry", help="Simulate broker unwind without real orders")):
+    """Manually and symmetrically close one persisted OPEN carry position."""
+    from ..db.models import CarryFundingPaymentRecord, CarryPositionRecord
+
+    db = get_db_manager()
+    db.create_tables()
+    session = db.get_session()
+    try:
+        record = session.get(CarryPositionRecord, position_id)
+    finally:
+        session.close()
+    if record is None:
+        console.print(f"[red]Carry position not found: {position_id}[/red]")
+        raise typer.Exit(1)
+    if record.status != "OPEN":
+        console.print(f"[yellow]Carry {position_id} is {record.status}; only OPEN positions can be unwound.[/yellow]")
+        raise typer.Exit(1)
+
+    position = _carry_position_from_record(record)
+    broker = _carry_build_broker(dry_run=dry)
+    try:
+        broker.unwind_twin_leg_carry(position)
+    except Exception as exc:
+        console.print(f"[red]Unwind could not be confirmed for {position_id}: {exc}[/red]")
+        raise typer.Exit(1)
+
+    session = db.get_session()
+    try:
+        persisted = session.get(CarryPositionRecord, position_id)
+        persisted.status = position.status
+        persisted.closed_at = datetime.fromtimestamp(position.closed_at, tz=timezone.utc)
+        session.commit()
+    finally:
+        session.close()
+    console.print(f"[bold green]Carry {position_id} closed successfully.[/bold green]")
+
+    # Discord DM (Blue) carry-unwind embed on a confirmed clean close.
+    from ..notifications import get_notifier
+    try:
+        funds_session = db.get_session()
+        try:
+            total_funding = float(funds_session.query(
+                __import__("sqlalchemy").func.coalesce(
+                    __import__("sqlalchemy").func.sum(CarryFundingPaymentRecord.funding_payment_usdt), 0.0,
+                )
+            ).filter(CarryFundingPaymentRecord.position_id == position_id).scalar() or 0.0)
+        finally:
+            funds_session.close()
+        opened = record.opened_at.replace(tzinfo=timezone.utc).timestamp()
+        closed = position.closed_at or time.time()
+        duration = _carry_duration_str(closed - opened)
+        get_notifier().notify_trade_close(
+            symbol=record.symbol,
+            side="CARRY UNWIND",
+            qty=float(record.quantity),
+            fill_price=float(record.spot_fill_price),
+            duration=duration,
+            is_carry=True,
+            extra={
+                "Status": "CLOSED",
+                "Total Funding Harvested (USDT)": f"{total_funding:+.6f}",
+            },
+        )
+    except Exception as exc:
+        logger.warning("Carry-unwind DM embed not sent: %s", exc)
+    try:
+        futures = broker.futures.connector.get_positions(record.symbol)
+        spot = broker.spot.connector.get_balances().get(position.base_asset, {})
+        console.print(f"Post-unwind reconciliation: futures positions={len(futures)}, spot {position.base_asset}={float(spot.get('total', 0.0)):.8f}")
+    except Exception as exc:
+        console.print(f"[yellow]Unwind confirmed, but post-unwind reconciliation unavailable: {exc}[/yellow]")
+
+
+@carry_app.command("start")
+def carry_start(
+    max_pairs: int = typer.Option(3, "--max-pairs", min=1, help="Maximum concurrent twin-leg positions"),
+    total_usdt: float = typer.Option(1000.0, "--total-usdt", min=1.0, help="Max portfolio capital deployed across all pairs (USDT)"),
+    per_pair_usdt: float = typer.Option(None, "--per-pair-usdt", help="Per-pair allocation (USDT); defaults to total / max-pairs"),
+    scan_interval: float = typer.Option(300.0, "--scan-interval", min=1.0, help="Cadence (seconds) to re-run FundingScanner discovery"),
+    min_apr: float = typer.Option(0.08, "--min-apr", help="Entry annualized-funding hurdle (fraction, e.g. 0.08 = 8%)"),
+    exit_apr: float = typer.Option(0.02, "--exit-apr", help="Unwind hurdle if funding collapses below (fraction)"),
+    quote: str = typer.Option("USDT", "--quote", help="Quote currency of the pairs to scan"),
+    poll: float = typer.Option(30.0, "--poll", help="Health-check cadence (seconds)"),
+    margin_buffer: float = typer.Option(0.20, "--margin-buffer", help="Minimum account margin safety ratio"),
+    dry: bool = typer.Option(False, "--dry", help="Simulate fills and never submit orders"),
+):
+    """Launch the autonomous multi-pair funding-harvester allocator on Binance Testnet."""
+    from ..execution.carry_daemon import CarryDaemonConfig, CarryHarvesterDaemon
+    from ..research.funding_scanner import FundingScanner
+
+    db = get_db_manager()
+    db.create_tables()
+    broker = _carry_build_broker(dry_run=dry)
+    config = CarryDaemonConfig(
+        quote_asset=quote,
+        max_active_pairs=max_pairs,
+        total_allocation_usdt=total_usdt,
+        allocation_per_pair_usdt=per_pair_usdt,
+        scan_interval_seconds=scan_interval,
+        min_apr_threshold=min_apr,
+        exit_apr_threshold=exit_apr,
+        poll_interval_seconds=poll,
+        min_margin_ratio=margin_buffer,
+        dry_run=dry,
+    )
+    per_pair = per_pair_usdt if per_pair_usdt is not None else total_usdt / max_pairs
+    console.print(
+        f"[bold cyan]Starting carry allocator | up to {max_pairs} pairs | "
+        f"${per_pair:,.2f}/pair | min APR={min_apr:.2%} (exit {exit_apr:.2%}) | "
+        f"{'DRY' if dry else 'TESTNET'}[/bold cyan]"
+    )
+    CarryHarvesterDaemon(config, broker, db, scanner=FundingScanner(quote=quote)).run()
+
+
+@carry_app.command("scan")
+def carry_scan(
+    top: Optional[int] = typer.Option(None, "--top", "-n", min=1, help="Limit to top-N opportunities by net APR"),
+    min_volume: float = typer.Option(10_000_000.0, "--min-volume", help="Minimum 24h USDT volume to include a pair"),
+    fee_drag_pct: float = typer.Option(0.14, "--fee-drag-pct", help="Round-trip both-leg fee drag, in percentage points"),
+    quote: str = typer.Option("USDT", "--quote", help="Quote currency to scan"),
+    anomaly_threshold_pct: float = typer.Option(2.0, "--anomaly-threshold-pct", help="Flag/exclude basis anomalies above this |basis|%"),
+    sample: bool = typer.Option(False, "--sample", help="Use representative offline sample data (no network)"),
+):
+    """Scan the Binance USDⓈ-M universe and rank carry/funding opportunities by net APR."""
+    from ..research.funding_scanner import FundingScanner, sample_provider
+
+    scanner = FundingScanner(
+        min_volume_usdt=min_volume,
+        fee_drag_pct=fee_drag_pct,
+        basis_anomaly_threshold_pct=anomaly_threshold_pct,
+        quote=quote,
+        top_n=top,
+    )
+
+    console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
+    console.print("[bold cyan]            FUNDING & BASIS SCANNER[/bold cyan]")
+    console.print("[bold cyan]──────────────────────────────────────────────[/bold cyan]")
+    try:
+        if sample:
+            opportunities = scanner.scan(sample_provider(quote=quote))
+            source_tag = "SAMPLE DATA (offline)"
+        else:
+            opportunities = scanner.scan()
+            source_tag = "LIVE BINANCE USDⓈ-M"
+    except Exception as exc:
+        console.print(f"[red]Funding scan failed: {exc}[/red]")
+        if not sample:
+            console.print("[yellow]Hint: many networks block production fapi.binance.com. "
+                          "Use --sample for an offline demo, or check connectivity.[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]{source_tag} · min volume ${min_volume:,.0f} · fee drag {fee_drag_pct:.2f}pp[/dim]")
+
+    if not opportunities:
+        console.print("[yellow]No carry opportunities met the filters.[/yellow]")
+        return
+
+    table = Table(title=f"Carry Funding Opportunities ({len(opportunities)})",
+                  show_header=True, header_style="bold cyan")
+    for column in ("Symbol", "Spot", "Futures", "Basis %", "Funding %/8h", "Gross APR %", "Net APR %", "Next Funding", "24h Vol ($)"):
+        table.add_column(column)
+    for o in opportunities:
+        table.add_row(
+            o.symbol,
+            f"${o.spot_price:,.4f}",
+            f"${o.futures_price:,.4f}",
+            f"{o.basis_spread_pct:+.3f}%",
+            f"{o.predicted_funding_rate * 100:+.4f}%",
+            f"{o.gross_apr_pct:+.2f}%",
+            f"{o.net_apr_pct:+.2f}%",
+            o.next_funding_time.strftime("%Y-%m-%d %H:%M UTC") if o.next_funding_time else "-",
+            f"{o.volume_24h_usdt:,.0f}",
+        )
+    console.print(table)
+
+    if scanner.anomalies:
+        console.print("[yellow]Flagged basis anomalies (excluded from ranking):[/yellow]")
+        for a in scanner.anomalies:
+            console.print(f"[yellow]  ⚠ {a['symbol']}: basis {a['basis_spread_pct']:+.3f}%[/yellow]")
+
+
+@carry_app.command("reconcile-funding")
+def carry_reconcile_funding(
+    lookback_hours: int = typer.Option(168, "--lookback", min=1, help="Hours of income history to scan for open or recently closed positions"),
+    dry: bool = typer.Option(False, "--dry", help="Report rows that would be inserted without writing to the ledger"),
+):
+    """Backfill missing settled-funding credits into the funding ledger.
+
+    Scans Binance USDⓈ-M /fapi/v1/income for each open (or recently closed)
+    carry position, matches FUNDING_FEE events to its ``CarryPositionRecord``,
+    and inserts any settlement whose ``(position_id, timestamp)`` is not already
+    recorded — recovering settlements the daemon's race missed (Defect 1).
+    Uses the exact ``CarryFundingPaymentRecord`` schema — no invented fields.
+    """
+    from ..db.models import CarryFundingPaymentRecord, CarryPositionRecord
+
+    db = get_db_manager()
+    db.create_tables()
+    broker = _carry_build_broker(dry_run=dry)
+
+    session = db.get_session()
+    try:
+        positions = session.query(CarryPositionRecord).all()
+        existing: Dict[str, set] = {}
+        for position_id, timestamp in session.query(
+            CarryFundingPaymentRecord.position_id, CarryFundingPaymentRecord.timestamp
+        ).all():
+            ms = int(timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            existing.setdefault(position_id, set()).add(ms)
+    finally:
+        session.close()
+
+    if not positions:
+        console.print("[yellow]No carry positions recorded; nothing to reconcile.[/yellow]")
+        return
+
+    cutoff_ms = int((time.time() - lookback_hours * 3600) * 1000)
+    inserted = 0
+    dup_skipped = 0
+    no_income = 0
+    mode = "DRY-RUN (no writes)" if dry else "LIVE (writing to ledger)"
+    console.print(f"[bold cyan]Reconciling carry funding income | {mode}[/bold cyan]")
+    console.print(f"[dim]lookback {lookback_hours}h · {len(positions)} position(s)[/dim]")
+
+    for record in positions:
+        opened_ms = int(record.opened_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        closed_ms = (
+            int(record.closed_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            if record.closed_at else int(time.time() * 1000)
+        )
+        # Only scan positions that could still have unsettled income: open ones,
+        # or closed ones still within the lookback window.
+        if record.status != "OPEN" and closed_ms < cutoff_ms:
+            continue
+        start_time = max(opened_ms, cutoff_ms)
+        try:
+            events = broker.futures.connector.get_funding_income_history(
+                record.symbol, start_time=start_time, limit=1000
+            )
+        except Exception as exc:
+            console.print(f"[yellow]  income fetch failed for {record.symbol}: {exc}[/yellow]")
+            no_income += 1
+            continue
+        if not events:
+            continue
+
+        rate_by_time = _carry_funding_rate_map(broker, record.symbol, start_time, closed_ms)
+        mark = _carry_mark_price(broker, record.symbol)
+        have = existing.get(record.position_id, set())
+        for event in events:
+            ev_time = int(event.get("time", 0) or 0)
+            income = float(event.get("income", 0.0) or 0.0)
+            if ev_time <= 0 or ev_time < start_time or ev_time > closed_ms or ev_time in have:
+                continue
+            ts = datetime.fromtimestamp(ev_time / 1000, tz=timezone.utc)
+            row = CarryFundingPaymentRecord(
+                position_id=record.position_id,
+                symbol=record.symbol,
+                funding_rate=rate_by_time.get(ev_time, 0.0),
+                funding_payment_usdt=income,
+                mark_price=mark,
+                timestamp=ts,
+            )
+            if dry:
+                console.print(
+                    f"  [dim]would insert[/dim] {record.symbol} {record.position_id} "
+                    f"{income:+.6f} USDT @ {ts:%Y-%m-%d %H:%M:%S}"
+                )
+                have.add(ev_time)
+                continue
+            w = db.get_session()
+            try:
+                w.add(row)
+                w.commit()
+                have.add(ev_time)
+                inserted += 1
+                console.print(
+                    f"  [green]✓[/green] {record.symbol} {record.position_id} "
+                    f"funding {income:+.6f} USDT recorded @ {ts:%Y-%m-%d %H:%M:%S} "
+                    f"(rate {rate_by_time.get(ev_time, 0.0) * 100:+.6f}%)"
+                )
+            except Exception as exc:
+                w.rollback()
+                dup_skipped += 1
+                logger.warning("Reconcile insert skipped for %s @ %s: %s", record.symbol, ts, exc)
+            finally:
+                w.close()
+
+    if dry:
+        console.print(f"\n[bold]Dry-run summary:[/bold] {len(existing)} already recorded; no ledger writes performed.")
+        return
+    console.print(
+        f"\n[bold green]Reconcile complete:[/bold green] {inserted} inserted · "
+        f"{dup_skipped} duplicate-skips · {no_income} symbols with no income fetch."
+    )
+    if inserted:
+        console.print("[dim]Run `carry payments` to view the updated funding ledger.[/dim]")
 
 
 @app.command()

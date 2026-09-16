@@ -105,9 +105,9 @@ models/*.h5
 reports/*.html
 reports/*.json
 
-# Dashboard (generated)
-dashboard/
-!dashboard/.gitkeep
+# Dashboard (generated) — root-only; source under src/crypto_quant/dashboard/ is tracked
+/dashboard/
+!/dashboard/.gitkeep
 
 # Data files (too large)
 data/candles/

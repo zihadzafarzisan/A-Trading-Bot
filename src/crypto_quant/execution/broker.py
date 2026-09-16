@@ -73,7 +73,12 @@ class Order:
     quantity: float
     order_type: str           # 'market' | 'limit'
     limit_price: Optional[float] = None
-    status: str = "new"       # new -> filled | rejected
+    reduce_only: bool = False  # Futures only: never opens a new position, only reduces
+    position_side: Optional[str] = None  # Futures: BOTH, LONG, or SHORT
+    suppress_notify: bool = False  # Internal/daemon orders: skip broker-level DM alerts
+    status: str = "new"       # new -> filled | rejected | new | partially_filled
+    exchange_order_id: Optional[str] = None  # Binance numeric orderId, when known
+    filled_quantity: Optional[float] = None  # Exchange-confirmed executed base quantity
     fill_price: Optional[float] = None
     fee: float = 0.0
     message: str = ""

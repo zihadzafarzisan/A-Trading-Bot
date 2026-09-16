@@ -158,7 +158,7 @@ class AppConfig(BaseSettings):
     dashboard: DashboardConfig = DashboardConfig()
     logging: LoggingConfig = LoggingConfig()
 
-    model_config = {"env_prefix": "", "env_file": ".env"}
+    model_config = {"env_prefix": "", "env_file": ".env", "extra": "ignore"}
 
 
 def load_config(config_path: str | Path | None = None) -> AppConfig:

@@ -1,0 +1,10 @@
+[
+  {
+    "type": "BLACKLIST",
+    "symbol": "SOLUSDT",
+    "strategy": "CARRY_ARBITRAGE",
+    "action": "BLOCK",
+    "rationale": "Sample disabled learning rule locking the LocalMemoryGate schema.",
+    "active": false
+  }
+]

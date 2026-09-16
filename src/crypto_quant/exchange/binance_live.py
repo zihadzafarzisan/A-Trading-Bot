@@ -313,13 +313,41 @@ class BinanceLiveConnector:
         return self.get_ticker_price(symbol)
 
     def get_funding_rate(self, symbol: str) -> float:
-        """Get latest funding rate (Futures only)."""
+        """Get the current predicted 8-hour funding rate (Futures only)."""
         if self.market_type == "futures":
             res = self._request(
                 "GET", "/fapi/v1/premiumIndex", params={"symbol": symbol.upper()}
             )
             return float(res.get("lastFundingRate", 0.0))
         return 0.0
+
+    def get_funding_rate_history(
+        self, symbol: str, limit: int = 1, start_time: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Return Binance's settled funding-rate history for a Futures symbol."""
+        if self.market_type != "futures":
+            return []
+        params: Dict[str, Any] = {"symbol": symbol.upper(), "limit": int(limit)}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        res = self._request("GET", "/fapi/v1/fundingRate", params=params)
+        return list(res) if isinstance(res, list) else []
+
+    def get_funding_income_history(
+        self, symbol: str, start_time: Optional[int] = None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return account-confirmed USDⓈ-M funding income events."""
+        if self.market_type != "futures":
+            return []
+        params: Dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "incomeType": "FUNDING_FEE",
+            "limit": int(limit),
+        }
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        res = self._request("GET", "/fapi/v1/income", params=params, signed=True)
+        return list(res) if isinstance(res, list) else []
 
     # -----------------------------------------------------------------------
     # Account & Position Management (Signed)
@@ -419,6 +447,17 @@ class BinanceLiveConnector:
                 return {"msg": "Margin type already set"}
             raise
 
+    def get_position_mode(self) -> str:
+        """Return USDⓈ-M Futures position mode as ``ONE_WAY`` or ``HEDGE``.
+
+        Binance returns ``dualSidePosition=true`` for Hedge Mode. Spot has no
+        position mode and therefore returns ``ONE_WAY`` for interface symmetry.
+        """
+        if self.market_type != "futures":
+            return "ONE_WAY"
+        res = self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
+        return "HEDGE" if bool(res.get("dualSidePosition", False)) else "ONE_WAY"
+
     # -----------------------------------------------------------------------
     # Trading & Order Management (Signed)
     # -----------------------------------------------------------------------
@@ -433,6 +472,7 @@ class BinanceLiveConnector:
         client_order_id: Optional[str] = None,
         reduce_only: bool = False,
         time_in_force: str = "GTC",
+        position_side: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Submit an order to Binance."""
         params: Dict[str, Any] = {
@@ -456,12 +496,31 @@ class BinanceLiveConnector:
         if stop_price is not None:
             params["stopPrice"] = stop_price
 
-        if self.market_type == "futures" and reduce_only:
-            params["reduceOnly"] = "true"
+        if self.market_type == "futures":
+            if position_side is not None:
+                normalized_position_side = position_side.upper()
+                if normalized_position_side not in ("BOTH", "LONG", "SHORT"):
+                    raise ValueError("position_side must be BOTH, LONG, or SHORT")
+                if reduce_only and normalized_position_side == "BOTH":
+                    # BOTH is valid in one-way mode; keep it explicit for callers
+                    # that have already discovered one-way mode.
+                    params["positionSide"] = "BOTH"
+                else:
+                    params["positionSide"] = normalized_position_side
+            # Binance rejects reduceOnly together with explicit hedge-mode
+            # positionSide. In Hedge Mode, the opposite side + SHORT/LONG
+            # positionSide is the close instruction itself.
+            if reduce_only and position_side is None or (
+                reduce_only and position_side is not None and normalized_position_side == "BOTH"
+            ):
+                params["reduceOnly"] = "true"
+        elif position_side is not None:
+            raise ValueError("position_side is only supported for Futures orders")
 
         path = "/api/v3/order" if self.market_type == "spot" else "/fapi/v1/order"
         logger.info(
-            "Submitting %s %s order [%s, qty=%s, price=%s, client_id=%s, reduce_only=%s]",
+            "Submitting %s %s order [%s, qty=%s, price=%s, client_id=%s, "
+            "reduce_only=%s, position_side=%s]",
             self.market_type,
             side.upper(),
             symbol.upper(),
@@ -469,6 +528,7 @@ class BinanceLiveConnector:
             price,
             client_order_id,
             reduce_only,
+            position_side,
         )
         return self._request("POST", path, params=params, signed=True)
 

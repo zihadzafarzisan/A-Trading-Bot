@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -29,6 +29,7 @@ from ..risk.manager import RiskManager
 from ..strategies import create_strategy
 from ..strategies.base import Direction, Signal
 from .broker import Order
+from .dashboard_commands import process_dashboard_commands
 from .live_broker import BinanceLiveBroker
 from .safety import IdempotencyRegistry, LiveSafetyGateKeeper, PositionReconciler
 from .worker import WorkerLock
@@ -86,7 +87,7 @@ class LiveExecutionWorker:
 
         self.strategy = create_strategy(self.config.strategy)
         self.idempotency = IdempotencyRegistry()
-        self.reconciler = PositionReconciler(connector, broker)
+        self.reconciler = PositionReconciler(connector, broker, symbol=self.config.symbol)
         self.exec_model = ExecutionModel(ExecutionConfig(market_type=self.config.market_type))
 
         self.bars_processed = 0
@@ -94,6 +95,7 @@ class LiveExecutionWorker:
         self.last_bar_time: Optional[int] = None
         self.is_running = False
         self._pending_signal: Optional[Signal] = None
+        self._entries_paused = False
 
         logger.info(
             "LiveExecutionWorker constructed [run=%s, env=%s, dry_run=%s, symbol=%s]",
@@ -102,6 +104,39 @@ class LiveExecutionWorker:
             self.config.dry_run,
             self.config.symbol,
         )
+
+    # -----------------------------------------------------------------------
+    # Dashboard IPC command handlers
+    # -----------------------------------------------------------------------
+    def _dashboard_handlers(self) -> Dict[str, Callable[[dict], None]]:
+        """Return command-name → handler map for process_dashboard_commands()."""
+        def reset_daily_loss(_params: dict) -> None:
+            self.risk.reset_daily()
+            logger.info("[DASHBOARD CMD] RESET_DAILY_LOSS: daily loss counter reset to 0.")
+
+        def pause_entries(_params: dict) -> None:
+            self._entries_paused = True
+            logger.info("[DASHBOARD CMD] PAUSE_ENTRIES: new entry signals will be suppressed.")
+
+        def resume_entries(_params: dict) -> None:
+            self._entries_paused = False
+            logger.info("[DASHBOARD CMD] RESUME_ENTRIES: entry signals re-enabled.")
+
+        def kill_switch_engage(_params: dict) -> None:
+            self.risk.emergency_stop()
+            logger.critical("[DASHBOARD CMD] KILL_SWITCH_ENGAGE: emergency stop engaged.")
+
+        def kill_switch_disengage(_params: dict) -> None:
+            self.risk.release_emergency_stop()
+            logger.warning("[DASHBOARD CMD] KILL_SWITCH_DISENGAGE: emergency stop released.")
+
+        return {
+            "RESET_DAILY_LOSS": reset_daily_loss,
+            "PAUSE_ENTRIES": pause_entries,
+            "RESUME_ENTRIES": resume_entries,
+            "KILL_SWITCH_ENGAGE": kill_switch_engage,
+            "KILL_SWITCH_DISENGAGE": kill_switch_disengage,
+        }
 
     # -----------------------------------------------------------------------
     # Safety Check & Startup
@@ -158,6 +193,7 @@ class LiveExecutionWorker:
 
         while self.is_running:
             self.lock.heartbeat()
+            process_dashboard_commands(self._dashboard_handlers())
 
             # Check stop flag
             if self._is_stop_requested():
@@ -214,6 +250,33 @@ class LiveExecutionWorker:
         # 3. Snapshot account equity & persist state
         self._persist_snapshot()
 
+        # 3.5 Discord: evaluation candle close alert (best-effort)
+        try:
+            from ..notifications.discord_dm import get_notifier
+            notifier = get_notifier()
+            # Trend bias: use the just-generated next-bar intent.
+            # (This keeps candle-close alerts actionable even in polling mode.)
+            prepared = self.strategy.setup(df)
+            signal = self.strategy.generate_signal(prepared, bar_idx)
+            trend_bias = getattr(signal, "direction_str", "") or str(getattr(signal, "reason", ""))
+            ohlc = {
+                "open": curr_open,
+                "high": curr_high,
+                "low": curr_low,
+                "close": curr_close,
+                "timestamp": bar_time,
+            }
+            if notifier is not None:
+                notifier.notify_candle_close(
+                    symbol=self.config.symbol,
+                    timeframe=self.config.timeframe,
+                    ohlc_dict=ohlc,
+                    trend_bias=trend_bias,
+                )
+        except Exception:
+            # Never affect trading loop
+            pass
+
         # 4. Generate signal for next bar
         prepared = self.strategy.setup(df)
         signal = self.strategy.generate_signal(prepared, bar_idx)
@@ -223,6 +286,11 @@ class LiveExecutionWorker:
     def _execute_signal(self, signal: Signal, entry_price: float, bar_time: int) -> None:
         """Validate risk, size, check idempotency, and place order."""
         if not signal.is_active or signal.stop_loss is None:
+            return
+
+        # Dashboard pause gate
+        if self._entries_paused:
+            logger.debug("[ENTRY GATE] Signal suppressed: entries paused via dashboard")
             return
 
         # Spot cannot short
@@ -283,6 +351,13 @@ class LiveExecutionWorker:
 
         placed = self.broker.place_order(order)
         self.orders_placed += 1
+        if placed.status in ("new", "partially_filled"):
+            logger.warning(
+                "[ORDER PENDING] %s remains %s after submission; exchange_id=%s",
+                placed.order_id,
+                placed.status,
+                placed.exchange_order_id,
+            )
 
         # Audit order in DB if present
         if self.db and placed:
@@ -377,9 +452,10 @@ class LiveExecutionWorker:
                 side=order.side,
                 order_type=order.order_type,
                 requested_qty=order.quantity,
-                executed_qty=order.quantity if order.status == "filled" else 0.0,
+                executed_qty=float(order.filled_quantity or 0.0),
                 requested_price=order.limit_price,
                 avg_fill_price=order.fill_price,
+                exchange_order_id=order.exchange_order_id,
                 fee=order.fee,
                 status=order.status,
                 rejection_reason=order.message if order.status == "rejected" else None,

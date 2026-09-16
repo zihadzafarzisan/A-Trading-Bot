@@ -214,6 +214,133 @@ class TestReconciliation:
         assert disc[0].symbol == "ETHUSDT"
 
 
+class TestLiveOrderFillPolling:
+    """Regression coverage for async Binance MARKET order acknowledgements."""
+
+    class FakeConnector:
+        market_type = "futures"
+        testnet = True
+
+        def __init__(self, create_response, query_responses=None):
+            self.create_response = create_response
+            self.query_responses = list(query_responses or [])
+            self.query_calls = 0
+
+        def get_exchange_info(self):
+            return {
+                "symbols": [
+                    {
+                        "symbol": "SOLUSDT",
+                        "baseAsset": "SOL",
+                        "quoteAsset": "USDT",
+                        "status": "TRADING",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "10000", "stepSize": "0.01"},
+                            {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                        ],
+                    }
+                ]
+            }
+
+        def get_ticker_price(self, symbol):
+            return 100.0
+
+        def create_order(self, **kwargs):
+            self.last_create = kwargs
+            return dict(self.create_response)
+
+        def query_order(self, **kwargs):
+            self.query_calls += 1
+            return dict(self.query_responses.pop(0))
+
+    def test_market_new_zero_qty_polls_until_filled(self):
+        connector = self.FakeConnector(
+            {"orderId": 111, "status": "NEW", "executedQty": "0", "cumQuote": "0"},
+            [{"orderId": 111, "status": "FILLED", "executedQty": "0.1", "cumQuote": "10.1"}],
+        )
+        broker = BinanceLiveBroker(
+            connector=connector,
+            dry_run=False,
+            market_fill_timeout_seconds=0.2,
+            market_fill_poll_interval_seconds=0.01,
+        )
+        order = broker.place_order(Order("cid", "SOLUSDT", "sell", 0.1, "market"))
+        assert order.status == "filled"
+        assert order.exchange_order_id == "111"
+        assert order.filled_quantity == pytest.approx(0.1)
+        assert order.fill_price == pytest.approx(101.0)
+        assert connector.query_calls == 1
+
+    def test_market_new_zero_qty_timeout_is_not_false_fill(self):
+        connector = self.FakeConnector(
+            {"orderId": 222, "status": "NEW", "executedQty": "0", "cumQuote": "0"},
+            [{"orderId": 222, "status": "NEW", "executedQty": "0", "cumQuote": "0"}] * 20,
+        )
+        broker = BinanceLiveBroker(
+            connector=connector,
+            dry_run=False,
+            market_fill_timeout_seconds=0.03,
+            market_fill_poll_interval_seconds=0.01,
+        )
+        order = broker.place_order(Order("cid", "SOLUSDT", "sell", 0.1, "market"))
+        assert order.status == "new"
+        assert order.filled_quantity == 0.0
+        assert order.fill_price is None
+        assert "timeout" in order.message
+
+    def test_partial_fill_is_not_reported_as_full_fill(self):
+        connector = self.FakeConnector(
+            {"orderId": 333, "status": "PARTIALLY_FILLED", "executedQty": "0.04", "cumQuote": "4.04"}
+        )
+        broker = BinanceLiveBroker(connector=connector, dry_run=False)
+        order = broker.place_order(Order("cid", "SOLUSDT", "sell", 0.1, "market"))
+        assert order.status == "partially_filled"
+        assert order.filled_quantity == pytest.approx(0.04)
+        assert order.fill_price == pytest.approx(101.0)
+
+
+class TestConnectorFuturesOrderParams:
+    def test_futures_position_side_and_reduce_only_are_sent(self):
+        connector = BinanceLiveConnector(api_key="mock", api_secret="mock", market_type="futures", testnet=True)
+        captured = {}
+
+        def fake_request(method, path, params=None, signed=False):
+            captured.update(params or {})
+            return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+
+        connector._request = fake_request
+        connector.create_order(
+            symbol="SOLUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=0.1,
+            client_order_id="cid",
+            reduce_only=False,
+            position_side="SHORT",
+        )
+        assert captured["positionSide"] == "SHORT"
+        assert "reduceOnly" not in captured
+        assert captured["newClientOrderId"] == "cid"
+
+        captured.clear()
+        connector.create_order(
+            symbol="SOLUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=0.1,
+            client_order_id="cid2",
+            reduce_only=True,
+            position_side=None,
+        )
+        assert captured["reduceOnly"] == "true"
+
+    def test_spot_rejects_position_side(self):
+        connector = BinanceLiveConnector(api_key="mock", api_secret="mock", market_type="spot", testnet=True)
+        with pytest.raises(ValueError, match="position_side"):
+            connector.create_order("SOLUSDT", "BUY", "MARKET", 0.1, position_side="SHORT")
+
+
 class TestSecretMasking:
     """Proves API secrets are never revealed in string representations."""
 

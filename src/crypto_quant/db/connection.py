@@ -29,8 +29,7 @@ class DatabaseManager:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self.engine = create_engine(
                 f"sqlite:///{self.db_path}",
-                connect_args={"check_same_thread": False},
-                poolclass=StaticPool,
+                connect_args={"check_same_thread": False, "timeout": 60.0},
                 echo=False,
             )
 

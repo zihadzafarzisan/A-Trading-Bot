@@ -1,4 +1,4 @@
-"""Strategy registry.
+﻿"""Strategy registry.
 
 Maps strategy_type -> strategy class and provides factory helpers used by the
 research/discovery pipeline. Registering a new strategy family is a one-line
@@ -12,6 +12,16 @@ from .trend import TrendStrategy
 from .momentum import MomentumStrategy
 from .mean_reversion import MeanReversionStrategy
 from .breakout import BreakoutStrategy
+from .mtf_trend_pullback import MTFTrendPullbackStrategy
+from .breakout_retest import BreakoutRetestStrategy
+from .trend_filtered_rsi import TrendFilteredRSIStrategy
+from .regime_adaptive import RegimeAdaptiveStrategy
+from .vwap_bollinger_mr import VWAPBollingerMRStrategy
+from .volatility_squeeze_breakout import VolatilitySqueezeBreakoutStrategy
+from .trend_channel_breakout import TrendChannelBreakoutStrategy
+from .volume_displacement_continuation import VolumeDisplacementContinuationStrategy
+from .adaptive_displacement_trailing import AdaptiveDisplacementTrailingStrategy
+from .volatility_compression_breakout import VolatilityCompressionBreakoutStrategy
 
 # Central registry: strategy_type -> strategy class.
 STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {
@@ -19,6 +29,16 @@ STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {
     "momentum": MomentumStrategy,
     "mean_reversion": MeanReversionStrategy,
     "breakout": BreakoutStrategy,
+    "mtf_trend_pullback": MTFTrendPullbackStrategy,
+    "breakout_retest": BreakoutRetestStrategy,
+    "trend_filtered_rsi": TrendFilteredRSIStrategy,
+    "regime_adaptive": RegimeAdaptiveStrategy,
+    "vwap_bollinger_mr": VWAPBollingerMRStrategy,
+    "volatility_squeeze_breakout": VolatilitySqueezeBreakoutStrategy,
+    "trend_channel_breakout": TrendChannelBreakoutStrategy,
+    "volume_displacement_continuation": VolumeDisplacementContinuationStrategy,
+    "adaptive_displacement_trailing": AdaptiveDisplacementTrailingStrategy,
+    "volatility_compression_breakout": VolatilityCompressionBreakoutStrategy,
 }
 
 

@@ -46,6 +46,17 @@ class Position:
     exit_reason: Optional[str] = None
     # liquidation
     liquidated: bool = False
+    # Dynamic stop management (Strategy #8)
+    initial_stop: Optional[float] = None
+    active_stop: Optional[float] = None
+    risk_r: Optional[float] = None
+    breakeven_active: bool = False
+    extra_state: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def effective_stop(self) -> Optional[float]:
+        """Stop used for exit checks (dynamic active_stop if set, else initial)."""
+        return self.active_stop if self.active_stop is not None else self.stop_loss
 
     @property
     def notional(self) -> float:

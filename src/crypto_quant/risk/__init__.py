@@ -5,6 +5,7 @@ from .limits import (
     EVENT_DAILY_LOSS, EVENT_WEEKLY_LOSS, EVENT_MAX_DRAWDOWN, EVENT_EXPOSURE,
     EVENT_LEVERAGE, EVENT_INVALID_ORDER,
 )
+from .local_memory import LocalMemoryGate
 from .position_sizing import PositionSizer, SizingResult, TrailingStop
 from .manager import RiskManager, PortfolioState, EntryCheckResult
 
@@ -13,6 +14,7 @@ __all__ = [
     "EVENT_EMERGENCY_STOP", "EVENT_MAX_POSITIONS", "EVENT_DAILY_LOSS",
     "EVENT_WEEKLY_LOSS", "EVENT_MAX_DRAWDOWN", "EVENT_EXPOSURE",
     "EVENT_LEVERAGE", "EVENT_INVALID_ORDER",
+    "LocalMemoryGate",
     "PositionSizer", "SizingResult", "TrailingStop",
     "RiskManager", "PortfolioState", "EntryCheckResult",
 ]
