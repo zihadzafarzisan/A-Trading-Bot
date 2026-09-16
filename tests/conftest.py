@@ -18,6 +18,13 @@ import tempfile
 # `crypto_quant.notifications.discord_dm.requests.request`; this fixture only
 # provides a safe fallback when a test doesn't explicitly override.
 
+@pytest.fixture(autouse=True)
+def disable_discord_network(monkeypatch):
+    """Ensure live Discord notifier stays inert across all tests."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+    monkeypatch.setenv("DISCORD_USER_ID", "")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+
 
 @pytest.fixture(autouse=True)
 def _isolate_discord_http(monkeypatch):
